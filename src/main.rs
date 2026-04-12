@@ -1,4 +1,4 @@
-use hyper_gen::{dist, params, sketch, sketch_cuda, types, utils};
+use dotani::{dist, params, sketch, sketch_cuda, types, utils};
 
 fn main() {
     let cli_params = utils::create_cli();
