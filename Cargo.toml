@@ -1,5 +1,5 @@
 [package]
-name = "hyper-gen"
+name = "dotani"
 version = "0.2.2"
 edition = "2021"
 
@@ -50,7 +50,7 @@ version = "0.8.10"
 features = ["xxh3", "const_xxh3"]
 
 [[bin]]
-name = "hyper-gen"
+name = "dotani"
 path = "src/main.rs"
 
 [profile.dev]
