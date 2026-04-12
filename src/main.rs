@@ -97,7 +97,7 @@ fn main() {
                 .short('s')
                 .long("scaled")
                 .help("Scaled factor for FracMinHash")
-                .default_value("1500")
+                .default_value("1")
                 .value_parser(value_parser!(u64))
                 .action(ArgAction::Set),
         )
