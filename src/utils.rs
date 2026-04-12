@@ -4,6 +4,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use log::{info, warn};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 
 use crate::{hd, params, types::*};
 
@@ -108,8 +109,6 @@ pub fn dump_ani_file(sketch_dist: &SketchDist) {
         )
     }
 }
-
-use std::collections::HashMap;
 
 pub fn dump_distribution_to_txt(path: &Path) {
     let mut file_sketch = load_sketch(path);
