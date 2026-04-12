@@ -1,40 +1,25 @@
-extern crate bindgen;
-extern crate cc;
-
 use std::{env, path::PathBuf, process::Command};
 
 use bindgen::CargoCallbacks;
 use regex::Regex;
 
 fn main() {
-    if cfg!(any(feature = "cuda-sketch-volta",feature = "cuda-sketch-ada-lovelace", feature = "cuda-sketch-ampere", feature = "cuda-sketch-hopper")) {
-        println!("cargo:rerun-if-changed={}", "cuda");
+    if cfg!(feature = "cuda-sketch") {
+        println!("cargo:rerun-if-changed=cuda");
+        println!("cargo:rerun-if-changed=src/cuda_kernel.cu");
+        println!("cargo:rerun-if-changed=src/cuda_kernel.h");
 
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
         let cuda_src = PathBuf::from("src/cuda_kernel.cu");
         let ptx_file = out_dir.join("cuda_kmer_hash.ptx");
 
-        // Determine architecture based on feature flags
-        let (arch, code) = if cfg!(feature = "cuda-sketch-ada-lovelace") {
-            ("compute_89", "sm_89") // Ada Lovelace architecture for NIVIDA RTX 4090 series
-        } else if cfg!(feature = "cuda-sketch-ampere") {
-            ("compute_80", "sm_80") // Ampere architecture for NIVIDA A100 series
-        } else if cfg!(feature = "cuda-sketch-hopper") {
-            ("compute_90", "sm_90") // // Hopper architecture for NIVIDA H100 series
-        } else if cfg!(feature = "cuda-sketch-volta") {
-            ("compute_70", "sm_70") // Volta architecture for NIVIDA V100 series
-        } else {
-            panic!("Unsupported GPU architecture feature flag!");
-        };
-
         let nvcc_status = Command::new("nvcc")
             .arg("-ptx")
             .arg("-o")
             .arg(&ptx_file)
             .arg(&cuda_src)
-            .arg(format!("-arch={}", arch))
-            .arg(format!("-code={}", code))
+            .arg("-arch=compute_70")
             .status()
             .unwrap();
 
@@ -54,11 +39,10 @@ fn main() {
         let generated_bindings = bindings.to_string();
 
         let pointer_regex = Regex::new(r"\*mut f32").unwrap();
-        let modified_bindings = pointer_regex.replace_all(&generated_bindings, "CudaSlice<f32>");
+        let modified_bindings =
+            pointer_regex.replace_all(&generated_bindings, "CudaSlice<f32>");
 
-        let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-        std::fs::write(out_path.join("bindings.rs"), modified_bindings.as_bytes())
+        std::fs::write(out_dir.join("bindings.rs"), modified_bindings.as_bytes())
             .expect("Failed to write bindings");
-
     }
 }
