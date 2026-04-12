@@ -207,7 +207,7 @@ pub unsafe fn decompress_hd_sketch(sketch: &mut FileSketch) -> Vec<i16> {
         hv_decompressed.clone_from(
             &_hv_decompressed
                 .into_iter()
-                .map(|i| (i as i16 - offset))
+                .map(|i| i as i16 - offset)
                 .collect(),
         );
     } else {

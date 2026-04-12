@@ -28,16 +28,16 @@ pub fn create_cli() -> CliParams {
         .target(Target::Stdout)
         .init();
 
-    let cmd = Command::new("hyper-gen")
-        .bin_name("hyper-gen")
+    let cmd = Command::new("dotani")
+        .bin_name("dotani")
         .subcommand_required(true)
         .version(params::VERSION)
         .about(
-            "HyperGen: Fast and memory-efficient genome sketching in hyperdimensional space\n\n
+            "DotANI: Fast and memory-efficient ANI estimation in hyperdimensional space\n\n
         1. Genome sketching using FracMinhash and hyperdimensional computing (HDC). Three file types (.fna .fa .fasta) are supported:\n
-        hyper-gen-rust sketch -p {fna_path} -o {output_sketch_file} \n\n
+        dotani sketch -p {fna_path} -o {output_sketch_file} \n\n
         2. ANI estimation and database search:\n
-        hyper-gen-rust dist -r {ref_sketch} -q {query_sketch} -o {output_ANI_results}",
+        dotani dist -r {ref_sketch} -q {query_sketch} -o {output_ANI_results}",
         )
         .subcommand(
             // sketch command
