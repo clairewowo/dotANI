@@ -8,11 +8,11 @@ use t1ha;
 #[inline]
 pub fn mm_hash(bytes: &[u8]) -> usize {
     let mut key = usize::from_ne_bytes(bytes.try_into().unwrap());
-    key = !key.wrapping_add(key << 21); // key = (key << 21) - key - 1;
+    key = !key.wrapping_add(key << 21);
     key = key ^ key >> 24;
-    key = (key.wrapping_add(key << 3)).wrapping_add(key << 8); // key * 265
+    key = (key.wrapping_add(key << 3)).wrapping_add(key << 8);
     key = key ^ key >> 14;
-    key = (key.wrapping_add(key << 2)).wrapping_add(key << 4); // key * 21
+    key = (key.wrapping_add(key << 2)).wrapping_add(key << 4);
     key = key ^ key >> 28;
     key = key.wrapping_add(key << 31);
     key
@@ -31,7 +31,6 @@ pub fn mm_hash64(kmer: u64) -> u64 {
     key
 }
 
-// Use avx2 mmhash in https://github.com/bluenote-1577/skani/blob/main/src/avx2_seeding.rs
 #[inline]
 #[target_feature(enable = "avx2")]
 pub unsafe fn mm_hash64_avx2(kmer: __m256i) -> __m256i {
@@ -78,6 +77,13 @@ pub struct CliParams {
     pub if_compressed: bool,
 
     pub threads: u8,
+
+    // ULL options
+    pub if_ull: bool,
+    pub ull_p: u32,
+    pub ull_out_file: PathBuf,
+    pub path_ref_ull: PathBuf,
+    pub path_query_ull: PathBuf,
 }
 
 pub struct SketchParams {
@@ -92,22 +98,31 @@ pub struct SketchParams {
     pub hv_d: usize,
     pub hv_quant_scale: f32,
     pub if_compressed: bool,
+
+    // ULL options
+    pub if_ull: bool,
+    pub ull_p: u32,
+    pub ull_out_file: PathBuf,
 }
 
 impl Default for SketchParams {
     fn default() -> Self {
         SketchParams {
-            path: (PathBuf::new()),
-            out_file: (PathBuf::new()),
+            path: PathBuf::new(),
+            out_file: PathBuf::new(),
             sketch_method: String::from("t1ha2"),
-            canonical: (true),
+            canonical: true,
             device: String::from("cpu"),
-            ksize: (21),
-            seed: (123),
-            scaled: (1500),
-            hv_d: (4096),
-            hv_quant_scale: (1.0),
-            if_compressed: (true),
+            ksize: 21,
+            seed: 123,
+            scaled: 1500,
+            hv_d: 4096,
+            hv_quant_scale: 1.0,
+            if_compressed: true,
+
+            if_ull: false,
+            ull_p: 14,
+            ull_out_file: PathBuf::new(),
         }
     }
 }
@@ -118,7 +133,7 @@ impl SketchParams {
         new_sketch.path = params.path.clone();
         new_sketch.out_file = params.out_file.clone();
         new_sketch.sketch_method = params.sketch_method.clone();
-        new_sketch.canonical = params.canonical.clone();
+        new_sketch.canonical = params.canonical;
         new_sketch.device = params.device.clone();
         new_sketch.ksize = params.ksize;
         new_sketch.seed = params.seed;
@@ -126,6 +141,11 @@ impl SketchParams {
         new_sketch.hv_d = params.hv_d;
         new_sketch.hv_quant_scale = params.hv_quant_scale;
         new_sketch.if_compressed = params.if_compressed;
+
+        new_sketch.if_ull = params.if_ull;
+        new_sketch.ull_p = params.ull_p;
+        new_sketch.ull_out_file = params.ull_out_file.clone();
+
         new_sketch
     }
 }
@@ -151,17 +171,17 @@ impl Default for Sketch {
         Sketch {
             file_name: String::from(""),
             sketch_method: String::from("xxh3"),
-            canonical: (true),
-            ksize: (21),
-            seed: (123),
-            scaled: (2000),
-            threshold: (u64::MAX / 2000),
+            canonical: true,
+            ksize: 21,
+            seed: 123,
+            scaled: 2000,
+            threshold: u64::MAX / 2000,
             hash_set: HashSet::default(),
-            hv_quant_scale: (1.0),
-            hv_quant_bits: (0),
-            hv_d: (4096),
-            hv: (vec![]),
-            hv_l2_norm_sq: (0),
+            hv_quant_scale: 1.0,
+            hv_quant_bits: 0,
+            hv_d: 4096,
+            hv: vec![],
+            hv_l2_norm_sq: 0,
         }
     }
 }
@@ -234,9 +254,21 @@ pub struct FileSketch {
     pub hv: Vec<i16>,
 }
 
+#[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
+pub struct FileUllSketch {
+    pub ksize: u8,
+    pub canonical: bool,
+    pub seed: u64,
+    pub ull_p: u32,
+    pub file_str: String,
+    pub ull_state: Vec<u8>,
+}
+
 pub struct SketchDist {
     pub path_ref_sketch: PathBuf,
     pub path_query_sketch: PathBuf,
+    pub path_ref_ull: PathBuf,
+    pub path_query_ull: PathBuf,
     pub out_file: PathBuf,
     pub ksize: u8,
     pub hv_d: usize,
@@ -247,13 +279,15 @@ pub struct SketchDist {
 impl Default for SketchDist {
     fn default() -> Self {
         SketchDist {
-            path_ref_sketch: (PathBuf::new()),
-            path_query_sketch: (PathBuf::new()),
-            out_file: (PathBuf::new()),
-            ksize: (21),
-            hv_d: (1024),
-            ani_threshold: (85.0),
-            file_ani: (Vec::<((String, String), f32)>::new()),
+            path_ref_sketch: PathBuf::new(),
+            path_query_sketch: PathBuf::new(),
+            path_ref_ull: PathBuf::new(),
+            path_query_ull: PathBuf::new(),
+            out_file: PathBuf::new(),
+            ksize: 21,
+            hv_d: 1024,
+            ani_threshold: 85.0,
+            file_ani: Vec::<((String, String), f32)>::new(),
         }
     }
 }
@@ -263,6 +297,8 @@ impl SketchDist {
         let mut new_dist = SketchDist::default();
         new_dist.path_ref_sketch = params.path_ref_sketch.clone();
         new_dist.path_query_sketch = params.path_query_sketch.clone();
+        new_dist.path_ref_ull = params.path_ref_ull.clone();
+        new_dist.path_query_ull = params.path_query_ull.clone();
         new_dist.out_file = params.out_file.clone();
         new_dist.ksize = params.ksize;
         new_dist.hv_d = params.hv_d;

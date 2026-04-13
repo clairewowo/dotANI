@@ -2,7 +2,7 @@ use crate::types::*;
 
 #[cfg(feature = "cuda-sketch")]
 use {
-    crate::{dist, fastx_reader, hd, utils},
+    crate::{dist, fastx_reader, hd, ultraloglog::UltraLogLog;::UltraLogLog, utils},
     cudarc::{
         driver::{CudaContext, LaunchConfig, PushKernelArg},
         nvrtc::Ptx,
@@ -10,7 +10,6 @@ use {
     glob::glob,
     log::info,
     rayon::prelude::*,
-    std::cmp::max,
     std::collections::HashSet,
     std::path::{Path, PathBuf},
     std::sync::Arc,
@@ -39,7 +38,7 @@ pub fn sketch_cuda(params: SketchParams) {
     error!("Cuda sketching is not supported. Please add `--features cuda-sketch` for installation to enable it.");
 }
 
-//  Sketch function to sketch all .fna files in folder path
+// Sketch all FASTA files using GPU hashing, then CPU ULL + CPU HD encoding
 #[cfg(all(target_arch = "x86_64", feature = "cuda-sketch"))]
 pub fn sketch_cuda(params: SketchParams) {
     let files = utils::get_fasta_files(&params.path);
@@ -54,40 +53,80 @@ pub fn sketch_cuda(params: SketchParams) {
             .unwrap(),
     );
 
-    let mut all_filesketch: Vec<FileSketch> = (0..n_file)
-        .map(|i| FileSketch {
-            ksize: params.ksize,
-            scaled: params.scaled,
-            seed: params.seed,
-            canonical: params.canonical,
-            hv_d: params.hv_d,
-            hv_quant_bits: 16u8,
-            hv_norm_2: 0,
-            file_str: files[i].display().to_string(),
-            hv: Vec::<i16>::new(),
+    let results: Vec<(FileSketch, Option<FileUllSketch>)> = files
+        .par_iter()
+        .map(|file| {
+            let mut sketch = FileSketch {
+                ksize: params.ksize,
+                scaled: params.scaled,
+                seed: params.seed,
+                canonical: params.canonical,
+                hv_d: params.hv_d,
+                hv_quant_bits: 16u8,
+                hv_norm_2: 0,
+                file_str: file.display().to_string(),
+                hv: Vec::<i16>::new(),
+            };
+
+            // Full hash stream from GPU
+            let full_hashes = extract_kmer_t1ha2_cuda_full_hashes(&sketch, &ctx, &module);
+
+            let threshold = u64::MAX / sketch.scaled;
+            let mut sampled_hash_set = HashSet::<u64>::new();
+
+            let ull_record = if params.if_ull {
+                let mut ull =
+                    UltraLogLog::new(params.ull_p).expect("Invalid UltraLogLog precision");
+
+                for &h in &full_hashes {
+                    ull.add(h);
+                    if h < threshold {
+                        sampled_hash_set.insert(h);
+                    }
+                }
+
+                Some(FileUllSketch {
+                    ksize: params.ksize,
+                    canonical: params.canonical,
+                    seed: params.seed,
+                    ull_p: params.ull_p,
+                    file_str: sketch.file_str.clone(),
+                    ull_state: ull.get_state().to_vec(),
+                })
+            } else {
+                for &h in &full_hashes {
+                    if h < threshold {
+                        sampled_hash_set.insert(h);
+                    }
+                }
+                None
+            };
+
+            let hv = if is_x86_feature_detected!("avx2") {
+                unsafe { hd::encode_hash_hd_avx2(&sampled_hash_set, &sketch) }
+            } else {
+                hd::encode_hash_hd(&sampled_hash_set, &sketch)
+            };
+
+            sketch.hv_norm_2 = dist::compute_hv_l2_norm(&hv);
+
+            if params.if_compressed {
+                sketch.hv_quant_bits = unsafe { hd::compress_hd_sketch(&mut sketch, &hv) };
+            } else {
+                sketch.hv = hv.clone();
+            }
+
+            pb.inc(1);
+            pb.eta();
+
+            (sketch, ull_record)
         })
         .collect();
 
-    all_filesketch.par_iter_mut().for_each(|sketch| {
-        let kmer_hash_set = extract_kmer_t1ha2_cuda(sketch, &ctx, &module);
-
-        let hv = if is_x86_feature_detected!("avx2") {
-            unsafe { hd::encode_hash_hd_avx2(&kmer_hash_set, &sketch) }
-        } else {
-            hd::encode_hash_hd(&kmer_hash_set, &sketch)
-        };
-
-        sketch.hv_norm_2 = dist::compute_hv_l2_norm(&hv);
-
-        if params.if_compressed {
-            sketch.hv_quant_bits = unsafe { hd::compress_hd_sketch(sketch, &hv) };
-        }
-
-        pb.inc(1);
-        pb.eta();
-    });
-
     pb.finish_and_clear();
+
+    let all_filesketch: Vec<FileSketch> = results.iter().map(|(fs, _)| fs.clone()).collect();
+    let all_ullsketch: Vec<FileUllSketch> = results.into_iter().filter_map(|(_, u)| u).collect();
 
     info!(
         "Sketching {} files took {:.2}s - Speed: {:.1} files/s",
@@ -97,25 +136,28 @@ pub fn sketch_cuda(params: SketchParams) {
     );
 
     utils::dump_sketch(&all_filesketch, &params.out_file);
+
+    if params.if_ull {
+        utils::dump_ull_sketch(&all_ullsketch, &params.ull_out_file);
+    }
 }
 
 #[cfg(feature = "cuda-sketch")]
-fn extract_kmer_t1ha2_cuda(
+fn extract_kmer_t1ha2_cuda_full_hashes(
     sketch: &FileSketch,
     ctx: &Arc<CudaContext>,
     module: &Arc<cudarc::driver::CudaModule>,
-) -> HashSet<u64> {
+) -> Vec<u64> {
     let fna_file = PathBuf::from(sketch.file_str.clone());
     let fna_seqs = fastx_reader::read_merge_seq(&fna_file);
 
     let n_bps = fna_seqs.len();
     let ksize = sketch.ksize as usize;
     let canonical = sketch.canonical;
-    let scaled = sketch.scaled;
     let seed = sketch.seed;
 
     if n_bps < ksize {
-        return HashSet::new();
+        return Vec::new();
     }
 
     let n_kmers = n_bps - ksize + 1;
@@ -125,7 +167,8 @@ fn extract_kmer_t1ha2_cuda(
     let stream = ctx.default_stream();
     let gpu_seq = stream.clone_htod(&fna_seqs).unwrap();
 
-    let n_hash_per_thread = max(kmer_per_thread / sketch.scaled as usize * 4, 8);
+    // Full hashes: enough slots for every k-mer a thread may emit
+    let n_hash_per_thread = kmer_per_thread;
     let n_hash_array = n_hash_per_thread * n_threads;
     let mut gpu_kmer_hash = stream.alloc_zeros::<u64>(n_hash_array).unwrap();
 
@@ -136,8 +179,11 @@ fn extract_kmer_t1ha2_cuda(
     builder.arg(&kmer_per_thread);
     builder.arg(&n_hash_per_thread);
     builder.arg(&ksize);
-    let binding = u64::MAX / scaled;
-    builder.arg(&binding);
+
+    // Hard-coded full hash mode
+    let full_threshold = u64::MAX;
+    builder.arg(&full_threshold);
+
     builder.arg(&seed);
     builder.arg(&canonical);
     builder.arg(&mut gpu_kmer_hash);
@@ -150,6 +196,8 @@ fn extract_kmer_t1ha2_cuda(
 
     let host_kmer_hash = stream.clone_dtoh(&gpu_kmer_hash).unwrap();
 
+    // Zero is the empty sentinel in the output array.
+    // A real hash of 0 is astronomically rare, so dropping it is acceptable here.
     host_kmer_hash.into_iter().filter(|&h| h != 0).collect()
 }
 
@@ -190,7 +238,8 @@ pub fn cuda_mmhash_bitpack_parallel(
             let gpu_seq = stream.clone_htod(&fna_seqs).unwrap();
             let gpu_seq_nt4_table = stream.clone_htod(&SEQ_NT4_TABLE).unwrap();
 
-            let n_hash_per_thread = max(bp_per_thread / scaled as usize * 3, 8);
+            // Full hashes from GPU, then sample on CPU
+            let n_hash_per_thread = bp_per_thread;
             let n_hash_array = n_hash_per_thread * n_threads;
             let mut gpu_kmer_bit_hash = stream.alloc_zeros::<u64>(n_hash_array).unwrap();
 
@@ -201,8 +250,10 @@ pub fn cuda_mmhash_bitpack_parallel(
             builder.arg(&bp_per_thread);
             builder.arg(&n_hash_per_thread);
             builder.arg(&ksize);
-            let binding = u64::MAX / scaled;
-            builder.arg(&binding);
+
+            let full_threshold = u64::MAX;
+            builder.arg(&full_threshold);
+
             builder.arg(&canonical);
             builder.arg(&gpu_seq_nt4_table);
             builder.arg(&mut gpu_kmer_bit_hash);
@@ -214,9 +265,13 @@ pub fn cuda_mmhash_bitpack_parallel(
             }
 
             let host_kmer_bit_hash = stream.clone_dtoh(&gpu_kmer_bit_hash).unwrap();
+            let threshold = u64::MAX / scaled;
 
             pb.inc(1);
-            host_kmer_bit_hash.into_iter().filter(|&h| h != 0).collect()
+            host_kmer_bit_hash
+                .into_iter()
+                .filter(|&h| h != 0 && h < threshold)
+                .collect()
         })
         .collect();
 
@@ -225,7 +280,6 @@ pub fn cuda_mmhash_bitpack_parallel(
 }
 
 #[cfg(feature = "cuda-sketch")]
-
 pub fn cuda_t1ha2_hash_parallel(
     path_fna: &String,
     ksize: usize,
@@ -265,7 +319,8 @@ pub fn cuda_t1ha2_hash_parallel(
             let stream = ctx.default_stream();
             let gpu_seq = stream.clone_htod(&fna_seqs).unwrap();
 
-            let n_hash_per_thread = max(kmer_per_thread / scaled as usize * 3, 8);
+            // Full hashes from GPU, then sample on CPU
+            let n_hash_per_thread = kmer_per_thread;
             let n_hash_array = n_hash_per_thread * n_threads;
             let mut gpu_kmer_hash = stream.alloc_zeros::<u64>(n_hash_array).unwrap();
 
@@ -276,8 +331,10 @@ pub fn cuda_t1ha2_hash_parallel(
             builder.arg(&kmer_per_thread);
             builder.arg(&n_hash_per_thread);
             builder.arg(&ksize);
-            let binding = u64::MAX / scaled;
-            builder.arg(&binding);
+
+            let full_threshold = u64::MAX;
+            builder.arg(&full_threshold);
+
             builder.arg(&seed);
             builder.arg(&canonical);
             builder.arg(&mut gpu_kmer_hash);
@@ -289,9 +346,13 @@ pub fn cuda_t1ha2_hash_parallel(
             }
 
             let host_kmer_hash = stream.clone_dtoh(&gpu_kmer_hash).unwrap();
+            let threshold = u64::MAX / scaled;
 
             pb.inc(1);
-            host_kmer_hash.into_iter().filter(|&h| h != 0).collect()
+            host_kmer_hash
+                .into_iter()
+                .filter(|&h| h != 0 && h < threshold)
+                .collect()
         })
         .collect();
 

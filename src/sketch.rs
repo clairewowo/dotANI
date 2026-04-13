@@ -7,6 +7,7 @@ use rayon::prelude::*;
 
 use crate::types::*;
 use crate::{dist, hd, utils};
+use ultraloglog::UltraLogLog;
 
 #[cfg(target_arch = "x86_64")]
 pub fn sketch(params: SketchParams) {
@@ -16,46 +17,64 @@ pub fn sketch(params: SketchParams) {
     info!("Start sketching...");
     let pb = utils::get_progress_bar(n_file);
 
-    let mut all_filesketch: Vec<FileSketch> = (0..n_file)
-        .into_iter()
-        .map(|i| FileSketch {
-            ksize: params.ksize,
-            scaled: params.scaled,
-            seed: params.seed,
-            canonical: params.canonical,
-            hv_d: params.hv_d,
-            hv_quant_bits: 16 as u8,
-            hv_norm_2: 0 as i32,
-            file_str: files[i].display().to_string(),
-            hv: Vec::<i16>::new(),
+    let results: Vec<(FileSketch, Option<FileUllSketch>)> = files
+        .par_iter()
+        .map(|file| {
+            let mut sketch = FileSketch {
+                ksize: params.ksize,
+                scaled: params.scaled,
+                seed: params.seed,
+                canonical: params.canonical,
+                hv_d: params.hv_d,
+                hv_quant_bits: 16u8,
+                hv_norm_2: 0,
+                file_str: file.display().to_string(),
+                hv: Vec::<i16>::new(),
+            };
+
+            let (kmer_hash_set, ull) = extract_kmer_hash_and_ull(&sketch, params.ull_p);
+
+            let hv = if is_x86_feature_detected!("avx2") {
+                unsafe { hd::encode_hash_hd_avx2(&kmer_hash_set, &sketch) }
+            } else {
+                hd::encode_hash_hd(&kmer_hash_set, &sketch)
+            };
+
+            sketch.hv_norm_2 = dist::compute_hv_l2_norm(&hv);
+
+            if params.if_compressed {
+                sketch.hv_quant_bits = unsafe { hd::compress_hd_sketch(&mut sketch, &hv) };
+            } else {
+                sketch.hv = hv.clone();
+            }
+
+            let ull_record = if params.if_ull {
+                Some(FileUllSketch {
+                    ksize: params.ksize,
+                    canonical: params.canonical,
+                    seed: params.seed,
+                    ull_p: params.ull_p,
+                    file_str: file.display().to_string(),
+                    ull_state: ull.get_state().to_vec(),
+                    // not used anymore in dist; keep for compatibility
+                    ull_cardinality: 0.0,
+                })
+            } else {
+                None
+            };
+
+            pb.inc(1);
+            pb.eta();
+
+            (sketch, ull_record)
         })
         .collect();
 
-    // Parallel sketching
-    all_filesketch.par_iter_mut().for_each(|sketch| {
-        // Extract kmer set from genome sequence
-        let kmer_hash_set = extract_kmer_hash(&sketch);
-
-        // Encode extracted kmer hash into sketch HV
-        let hv = if is_x86_feature_detected!("avx2") {
-            unsafe { hd::encode_hash_hd_avx2(&kmer_hash_set, &sketch) }
-        } else {
-            hd::encode_hash_hd(&kmer_hash_set, &sketch)
-        };
-
-        // Pre-compute HV's norm
-        sketch.hv_norm_2 = dist::compute_hv_l2_norm(&hv);
-
-        // Sketch HV compression
-        if params.if_compressed {
-            sketch.hv_quant_bits = unsafe { hd::compress_hd_sketch(sketch, &hv) };
-        }
-
-        pb.inc(1);
-        pb.eta();
-    });
-
     pb.finish_and_clear();
+
+    let all_filesketch: Vec<FileSketch> = results.iter().map(|(fs, _)| fs.clone()).collect();
+
+    let all_ullsketch: Vec<FileUllSketch> = results.into_iter().filter_map(|(_, u)| u).collect();
 
     info!(
         "Sketching {} files took {:.2}s - Speed: {:.1} files/s",
@@ -64,81 +83,42 @@ pub fn sketch(params: SketchParams) {
         pb.per_sec()
     );
 
-    // Dump sketch file
     utils::dump_sketch(&all_filesketch, &params.out_file);
+
+    if params.if_ull {
+        utils::dump_ull_sketch(&all_ullsketch, &params.ull_out_file);
+    }
 }
 
-fn extract_kmer_hash(sketch: &FileSketch) -> HashSet<u64> {
+fn extract_kmer_hash_and_ull(sketch: &FileSketch, ull_p: u32) -> (HashSet<u64>, UltraLogLog) {
     let ksize = sketch.ksize;
     let threshold = u64::MAX / sketch.scaled;
     let seed = sketch.seed;
 
-    let mut fastx_reader = parse_fastx_file(PathBuf::from(sketch.file_str.clone()))
-        .expect("Opening .fna files failed");
+    let mut fastx_reader =
+        parse_fastx_file(PathBuf::from(sketch.file_str.clone())).expect("Opening .fna files failed");
 
     let mut hash_set = HashSet::<u64>::new();
+    let mut ull = UltraLogLog::new(ull_p).expect("Invalid UltraLogLog precision");
+
     while let Some(record) = fastx_reader.next() {
         let seqrec: needletail::parser::SequenceRecord<'_> = record.expect("invalid record");
 
-        // normalize to make sure all the bases are consistently capitalized
         let norm_seq = seqrec.normalize(false);
-
-        // we make a reverse complemented copy of the sequence
         let rc = norm_seq.reverse_complement();
 
         for (_, kmer, _) in norm_seq.canonical_kmers(ksize, &rc) {
             let h = t1ha::t1ha2_atonce(kmer, seed);
 
+            // ULL tracks the full original hashed k-mer stream
+            ull.add(h);
+
+            // HD sketch uses the FracMinHash-thresholded sample
             if h < threshold {
                 hash_set.insert(h);
             }
         }
     }
-    hash_set
+
+    (hash_set, ull)
 }
-
-// #[cfg(target_arch = "x86_64")]
-// unsafe fn extract_kmer_hash_avx2(file: PathBuf, sketch: &mut Sketch) {
-//     let mut fastx_reader = parse_fastx_file(&file).expect("Opening .fna files failed");
-
-//     while let Some(record) = fastx_reader.next() {
-//         let seqrec: needletail::parser::SequenceRecord<'_> = record.expect("invalid record");
-
-//         // normalize to make sure all the bases are consistently capitalized
-//         let norm_seq = seqrec.normalize(false);
-
-//         let mut bitkmer_array: [i64; 4] = [0, 0, 0, 0];
-//         let mut bitkmer_m256: __m256i;
-//         let mut cnt: usize = 0;
-//         for (_, (bit_kmer_u64, _), _) in norm_seq.bit_kmers(sketch.ksize, true) {
-//             if cnt < 4 {
-//                 bitkmer_array[cnt] = bit_kmer_u64 as i64;
-//                 cnt += 1;
-//             } else {
-//                 bitkmer_m256 = _mm256_set_epi64x(
-//                     bitkmer_array[0],
-//                     bitkmer_array[1],
-//                     bitkmer_array[2],
-//                     bitkmer_array[3],
-//                 );
-//                 sketch.insert_kmer_u64_avx2(bitkmer_m256);
-//                 cnt = 0;
-//             }
-//         }
-
-//         if cnt > 0 {
-//             bitkmer_m256 = match cnt {
-//                 1 => _mm256_set_epi64x(bitkmer_array[0], 0, 0, 0),
-//                 2 => _mm256_set_epi64x(bitkmer_array[0], bitkmer_array[1], 0, 0),
-//                 3 => _mm256_set_epi64x(bitkmer_array[0], bitkmer_array[1], bitkmer_array[2], 0),
-//                 _ => _mm256_set_epi64x(
-//                     bitkmer_array[0],
-//                     bitkmer_array[1],
-//                     bitkmer_array[2],
-//                     bitkmer_array[3],
-//                 ),
-//             };
-//             sketch.insert_kmer_u64_avx2(bitkmer_m256);
-//         }
-//     }
-// }

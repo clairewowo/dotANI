@@ -103,6 +103,30 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
+            Arg::new("ull")
+                .long("ull")
+                .help("Whether to generate UltraLogLog sketches")
+                .default_value("true")
+                .value_parser(value_parser!(bool))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ull_p")
+                .long("ull-p")
+                .help("UltraLogLog precision parameter")
+                .default_value("14")
+                .value_parser(value_parser!(u32))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ull_out")
+                .long("ull-out")
+                .help("Output UltraLogLog sketch file")
+                .required(false)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
             Arg::new("hv_d")
                 .short('d')
                 .long("hv-d")
@@ -238,6 +262,22 @@ fn main() {
                 .help("Scaling factor for HV quantization")
                 .default_value("1.0")
                 .value_parser(value_parser!(f32))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("path_r_ull")
+                .long("path-r-ull")
+                .help("Path to reference UltraLogLog sketch file")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("path_q_ull")
+                .long("path-q-ull")
+                .help("Path to query UltraLogLog sketch file")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
                 .action(ArgAction::Set),
         )
         .arg(
@@ -415,6 +455,18 @@ fn main() {
             if_compressed: true,
             threads: *sketch_m.get_one::<u8>("thread").unwrap(),
             device: sketch_m.get_one::<String>("device").cloned().unwrap(),
+            if_ull: *sketch_m.get_one::<bool>("ull").unwrap(),
+            ull_p: *sketch_m.get_one::<u32>("ull_p").unwrap(),
+            ull_out_file: sketch_m
+                .get_one::<PathBuf>("ull_out")
+                .cloned()
+                .unwrap_or_else(|| {
+                    let mut p = sketch_m.get_one::<PathBuf>("out").cloned().unwrap();
+                    p.set_extension("ull");
+                    p
+                }),
+            path_ref_ull: PathBuf::new(),
+            path_query_ull: PathBuf::new(),
         };
 
         rayon::ThreadPoolBuilder::new()
@@ -450,6 +502,11 @@ fn main() {
             if_compressed: true,
             threads: *dist_m.get_one::<u8>("thread").unwrap(),
             device: dist_m.get_one::<String>("device").cloned().unwrap(),
+            if_ull: true,
+            ull_p: 0,
+            ull_out_file: PathBuf::new(),
+            path_ref_ull: dist_m.get_one::<PathBuf>("path_r_ull").cloned().unwrap(),
+            path_query_ull: dist_m.get_one::<PathBuf>("path_q_ull").cloned().unwrap(),
         };
 
         rayon::ThreadPoolBuilder::new()

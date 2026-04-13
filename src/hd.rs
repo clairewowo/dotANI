@@ -1,232 +1,569 @@
-use log::info;
-use std::arch::x86_64::*;
-use std::collections::HashSet;
+use std::io::Write;
+use std::path::PathBuf;
 
-use crate::types::FileSketch;
-use rand::{RngCore, SeedableRng};
-use wyhash::WyRng;
+use chrono::Local;
+use clap::{value_parser, Arg, ArgAction, Command};
+use env_logger::{Builder, Target};
+use log::LevelFilter;
 
-extern crate bitpacking;
-use bitpacking::{BitPacker, BitPacker8x};
+use dotani::{dist, params, sketch, sketch_cuda, types};
 
-use rayon::prelude::*;
-
-#[target_feature(enable = "avx2")]
-pub unsafe fn encode_hash_hd_avx2(kmer_hash_set: &HashSet<u64>, sketch: &FileSketch) -> Vec<i16> {
-    let hv_d = sketch.hv_d;
-    let _mm256_const_one_epi16 = _mm256_set1_epi16(1);
-    let _mm256_const_zero = _mm256_setzero_si256();
-    let shuffle_mask = _mm256_set_epi8(
-        15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0, 15, 14, 7, 6, 13, 12, 5, 4, 11, 10,
-        3, 2, 9, 8, 1, 0,
-    );
-
-    let mut rng_vec = vec![WyRng::default(); 4];
-    // let mut rng_vec = vec![SeedableRng::seed_from_u64(0); 4];
-    let mut rnd_vec: Vec<u64> = vec![0; 4];
-
-    let num_seed = kmer_hash_set.len();
-    let mut hv = vec![-(num_seed as i16); hv_d];
-
-    let num_tail = num_seed % 4;
-    let num_seed_round_4 = num_seed + (if num_tail == 0 { 0 } else { 4 - num_tail });
-    let num_batch_round_4 = num_seed_round_4 / 4;
-    let num_chunk = hv_d / 64;
-
-    let mut seed_vec = Vec::from_iter(kmer_hash_set.clone());
-    // padding seed_vec with size rounded by 4
-    seed_vec.resize(num_seed_round_4, 0);
-
-    // loop through all batches with seeds<=4
-    for b_i in 0..num_batch_round_4 {
-        // fetch seeds and load into RNG
-        for j in 0..4 {
-            rng_vec[j] = WyRng::seed_from_u64(seed_vec[b_i * 4 + j]);
-        }
-
-        // SIMD-based HV encoding
-        for i in 0..num_chunk {
-            // load rnd into 256b buffer
-            for j in 0..4 {
-                rnd_vec[j] = rng_vec[j].next_u64();
-            }
-
-            if b_i == num_batch_round_4 - 1 && num_tail > 0 {
-                for j in num_tail..4 {
-                    rnd_vec[j] = 0;
-                }
-            }
-
-            // HD aggregation encoding
-            let simd_rnd_4_shuffle = _mm256_shuffle_epi8(
-                _mm256_set_epi64x(
-                    rnd_vec[0] as i64,
-                    rnd_vec[1] as i64,
-                    rnd_vec[2] as i64,
-                    rnd_vec[3] as i64,
-                ),
-                shuffle_mask,
-            );
-
-            for k in 0..16_usize {
-                let shift_and_256 = _mm256_and_si256(
-                    _mm256_srl_epi16(simd_rnd_4_shuffle, _mm_set1_epi64x(k as i64)),
-                    // _mm256_slli_epi16(simd_rnd_4_shuffle, k),
-                    _mm256_const_one_epi16,
-                );
-
-                let mut hadd_ = _mm256_hadd_epi16(shift_and_256, _mm256_const_zero);
-                hadd_ = _mm256_permute4x64_epi64(hadd_, 0xD8);
-                hadd_ = _mm256_shuffle_epi8(hadd_, shuffle_mask);
-                hadd_ = _mm256_hadd_epi16(hadd_, _mm256_const_zero);
-                hadd_ = _mm256_slli_epi16(hadd_, 1);
-
-                hv[i * 64 + k * 4] += _mm256_extract_epi16::<0>(hadd_) as i16;
-                hv[i * 64 + k * 4 + 1] += _mm256_extract_epi16::<1>(hadd_) as i16;
-                hv[i * 64 + k * 4 + 2] += _mm256_extract_epi16::<2>(hadd_) as i16;
-                hv[i * 64 + k * 4 + 3] += _mm256_extract_epi16::<3>(hadd_) as i16;
-            }
-        }
-    }
-    hv
+fn init_log() {
+    Builder::new()
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "{} [{}] - {}",
+                Local::now().format("%Y-%m-%d-%H:%M:%S"),
+                record.level(),
+                record.args()
+            )
+        })
+        .filter(None, LevelFilter::Info)
+        .target(Target::Stdout)
+        .init();
 }
 
-pub fn encode_hash_hd(kmer_hash_set: &HashSet<u64>, sketch: &FileSketch) -> Vec<i16> {
-    let hv_d = sketch.hv_d;
-    let seed_vec = Vec::from_iter(kmer_hash_set.clone());
-    let mut hv = vec![-(kmer_hash_set.len() as i16); hv_d];
+fn main() {
+    init_log();
 
-    for hash in seed_vec {
-        let mut rng = WyRng::seed_from_u64(hash);
-
-        for i in 0..(hv_d / 64) {
-            let rnd_btis = rng.next_u64();
-
-            for j in 0..64 {
-                hv[i * 64 + j] += (((rnd_btis >> j) & 1) << 1) as i16;
-            }
-        }
-    }
-
-    hv
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-pub unsafe fn compress_hd_sketch(sketch: &mut FileSketch, hv: &Vec<i16>) -> u8 {
-    let hv_d = sketch.hv_d;
-
-    // find the lossless quantization bit width
-    let min_hv = hv.iter().min().unwrap().clone();
-    let max_hv = hv.iter().max().unwrap().clone();
-
-    let mut quant_bit: i16 = 6;
-    loop {
-        let quant_min: i16 = -(1 << (quant_bit - 1));
-        let quant_max: i16 = (1 << (quant_bit - 1)) - 1;
-
-        if quant_min <= min_hv && quant_max >= max_hv {
-            break;
-        }
-
-        if quant_bit == 16 {
-            break;
-        }
-        quant_bit += 1;
-    }
-
-    // bit packing
-    if is_x86_feature_detected!("avx2") {
-        let offset: i16 = 1 << (quant_bit - 1);
-        let hv_u32: Vec<u32> = hv.iter().map(|&i| (i + offset) as u32).collect();
-
-        let bitpacker = BitPacker8x::new();
-        let bits_per_block = quant_bit as usize * 32;
-
-        let mut hv_compress_bits = vec![0u8; (quant_bit as usize) * (hv_d >> 3)];
-        for i in 0..(hv_d / BitPacker8x::BLOCK_LEN) {
-            bitpacker.compress(
-                &hv_u32[i * BitPacker8x::BLOCK_LEN..(i + 1) * BitPacker8x::BLOCK_LEN],
-                &mut hv_compress_bits[(bits_per_block * i)..(bits_per_block * (i + 1))],
-                quant_bit as u8,
-            );
-        }
-
-        sketch
-            .hv
-            .clone_from(&hv_compress_bits[..].align_to::<i16>().1.to_vec());
-    } else {
-        let len_bit_vec_u16 = (quant_bit as usize * hv_d + 16) / 16;
-        let mut hv_compress_bits: Vec<i16> = vec![0; len_bit_vec_u16];
-        for i in 0..(quant_bit as usize * hv_d) {
-            hv_compress_bits[i / 16] |=
-                ((hv[i / quant_bit as usize] >> (i % quant_bit as usize)) & 1) << (i % 16);
-        }
-        sketch.hv.clone_from(&hv_compress_bits);
-    }
-
-    quant_bit as u8
-}
-
-pub fn decompress_file_sketch(file_sketch: &mut Vec<FileSketch>) {
-    let hv_dim = file_sketch[0].hv_d;
-
-    info!("Decompressing sketch with HV dim={}", hv_dim);
-
-    file_sketch.into_par_iter().for_each(|sketch| {
-        let hv_decompressed = unsafe { decompress_hd_sketch(sketch) };
-        sketch.hv.clone_from(&hv_decompressed);
-    });
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-pub unsafe fn decompress_hd_sketch(sketch: &mut FileSketch) -> Vec<i16> {
-    let hv_d = sketch.hv_d;
-    let quant_bit = sketch.hv_quant_bits;
-
-    let mut hv_decompressed: Vec<i16> = vec![0; hv_d];
-
-    if is_x86_feature_detected!("avx2") {
-        // SIMD-based Bit Unpacking
-        let bitpacker = BitPacker8x::new();
-        let bits_per_block = quant_bit as usize * 32;
-
-        let hv_u8 = sketch.hv.align_to::<u8>().1.to_vec();
-        let mut _hv_decompressed: Vec<u32> = vec![0; hv_d];
-
-        for i in 0..(hv_d / BitPacker8x::BLOCK_LEN) {
-            bitpacker.decompress(
-                &hv_u8[(bits_per_block * i)..(bits_per_block * (i + 1))],
-                &mut _hv_decompressed[i * BitPacker8x::BLOCK_LEN..(i + 1) * BitPacker8x::BLOCK_LEN],
-                quant_bit,
-            );
-        }
-
-        let offset: i16 = 1 << (quant_bit - 1);
-        hv_decompressed.clone_from(
-            &_hv_decompressed
-                .into_iter()
-                .map(|i| i as i16 - offset)
-                .collect(),
+    let sketch_cmd = Command::new(params::CMD_SKETCH)
+        .version("0.1.0")
+        .about("Sketch genome FASTA files into DotHash and UltraLogLog sketches")
+        .arg(
+            Arg::new("path")
+                .short('p')
+                .long("path")
+                .help("Input folder path containing .fna/.fa/.fasta files")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("out")
+                .short('o')
+                .long("out")
+                .help("Output DotHash sketch file")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("thread")
+                .short('t')
+                .long("thread")
+                .help("Number of threads used for computation")
+                .default_value("16")
+                .value_parser(value_parser!(u8))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("sketch_method")
+                .short('m')
+                .long("sketch-method")
+                .help("Sketch method")
+                .default_value("t1ha2")
+                .value_parser(value_parser!(String))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("canonical")
+                .short('C')
+                .long("canonical")
+                .help("Whether to use canonical k-mers")
+                .default_value("true")
+                .value_parser(value_parser!(bool))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ksize")
+                .short('k')
+                .long("ksize")
+                .help("k-mer size for sketching")
+                .default_value("21")
+                .value_parser(value_parser!(u8))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("seed")
+                .short('S')
+                .long("seed")
+                .help("Hash seed")
+                .default_value("123")
+                .value_parser(value_parser!(u64))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("scaled")
+                .short('s')
+                .long("scaled")
+                .help("Scaled factor for FracMinHash")
+                .default_value("1")
+                .value_parser(value_parser!(u64))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ull")
+                .long("ull")
+                .help("Whether to generate UltraLogLog sketches")
+                .default_value("true")
+                .value_parser(value_parser!(bool))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ull_p")
+                .long("ull-p")
+                .help("UltraLogLog precision parameter")
+                .default_value("14")
+                .value_parser(value_parser!(u32))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ull_out")
+                .long("ull-out")
+                .help("Output UltraLogLog sketch file")
+                .required(false)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("hv_d")
+                .short('d')
+                .long("hv-d")
+                .help("Dimension for hypervector")
+                .default_value("4096")
+                .value_parser(value_parser!(usize))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("quant_scale")
+                .short('Q')
+                .long("quant-scale")
+                .help("Scaling factor for HV quantization")
+                .default_value("1.0")
+                .value_parser(value_parser!(f32))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ani_th")
+                .short('a')
+                .long("ani-th")
+                .help("ANI threshold")
+                .default_value("85.0")
+                .value_parser(value_parser!(f32))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("device")
+                .short('D')
+                .long("device")
+                .help("Device to run on")
+                .default_value("cpu")
+                .value_parser(["cpu", "gpu"])
+                .action(ArgAction::Set),
         );
-    } else {
-        // Scalar Bit Unpacking
-        for i in 0..(quant_bit as usize * hv_d) {
-            hv_decompressed[i / quant_bit as usize] |=
-                (((sketch.hv[i / 16] >> (i % 16)) & 1) << (i % quant_bit as usize)) as i16;
 
-            if (i + 1) % quant_bit as usize == 0 {
-                hv_decompressed[i / quant_bit as usize] = {
-                    if hv_decompressed[i / quant_bit as usize] > (1 << (quant_bit - 1)) {
-                        hv_decompressed[i / quant_bit as usize] - (1 << quant_bit)
-                    } else {
-                        hv_decompressed[i / quant_bit as usize]
-                    }
-                };
-            }
+    let dist_cmd = Command::new(params::CMD_DIST)
+        .about("Estimate ANI from reference and query sketch files")
+        .arg(
+            Arg::new("path_r")
+                .short('r')
+                .long("path-r")
+                .help("Path to reference DotHash sketch file")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("path_q")
+                .short('q')
+                .long("path-q")
+                .help("Path to query DotHash sketch file")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("path_r_ull")
+                .long("path-r-ull")
+                .help("Path to reference UltraLogLog sketch file")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("path_q_ull")
+                .long("path-q-ull")
+                .help("Path to query UltraLogLog sketch file")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("out")
+                .short('o')
+                .long("out")
+                .help("Output ANI results file")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("thread")
+                .short('t')
+                .long("thread")
+                .help("Number of threads used for computation")
+                .default_value("16")
+                .value_parser(value_parser!(u8))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("sketch_method")
+                .short('m')
+                .long("sketch-method")
+                .help("Sketch method")
+                .default_value("fracminhash")
+                .value_parser(value_parser!(String))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("canonical")
+                .short('C')
+                .long("canonical")
+                .help("Whether to use canonical k-mers")
+                .default_value("true")
+                .value_parser(value_parser!(bool))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ksize")
+                .short('k')
+                .long("ksize")
+                .help("k-mer size for sketching")
+                .default_value("16")
+                .value_parser(value_parser!(u8))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("seed")
+                .short('S')
+                .long("seed")
+                .help("Hash seed")
+                .default_value("123")
+                .value_parser(value_parser!(u64))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("scaled")
+                .short('s')
+                .long("scaled")
+                .help("Scaled factor for FracMinHash")
+                .default_value("1")
+                .value_parser(value_parser!(u64))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("hv_d")
+                .short('d')
+                .long("hv-d")
+                .help("Dimension for hypervector")
+                .default_value("4096")
+                .value_parser(value_parser!(usize))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("quant_scale")
+                .short('Q')
+                .long("quant-scale")
+                .help("Scaling factor for HV quantization")
+                .default_value("1.0")
+                .value_parser(value_parser!(f32))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ani_th")
+                .short('a')
+                .long("ani-th")
+                .help("ANI threshold")
+                .default_value("85.0")
+                .value_parser(value_parser!(f32))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("device")
+                .short('D')
+                .long("device")
+                .help("Device to run on")
+                .default_value("cpu")
+                .value_parser(["cpu", "gpu"])
+                .action(ArgAction::Set),
+        );
+
+    let search_cmd = Command::new(params::CMD_SEARCH)
+        .about("Search a query sketch against a sketch database")
+        .arg(
+            Arg::new("path")
+                .short('p')
+                .long("path")
+                .help("Path to sketch file or sketch database")
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("path_r")
+                .short('r')
+                .long("path-r")
+                .help("Path to reference sketch file")
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("path_q")
+                .short('q')
+                .long("path-q")
+                .help("Path to query sketch file")
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("out")
+                .short('o')
+                .long("out")
+                .help("Output search results file")
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("thread")
+                .short('t')
+                .long("thread")
+                .help("Number of threads used for computation")
+                .default_value("16")
+                .value_parser(value_parser!(u8))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("sketch_method")
+                .short('m')
+                .long("sketch-method")
+                .help("Sketch method")
+                .default_value("fracminhash")
+                .value_parser(value_parser!(String))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("canonical")
+                .short('C')
+                .long("canonical")
+                .help("Whether to use canonical k-mers")
+                .default_value("true")
+                .value_parser(value_parser!(bool))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ksize")
+                .short('k')
+                .long("ksize")
+                .help("k-mer size for sketching")
+                .default_value("21")
+                .value_parser(value_parser!(u8))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("seed")
+                .short('S')
+                .long("seed")
+                .help("Hash seed")
+                .default_value("123")
+                .value_parser(value_parser!(u64))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("scaled")
+                .short('s')
+                .long("scaled")
+                .help("Scaled factor for FracMinHash")
+                .default_value("1")
+                .value_parser(value_parser!(u64))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("hv_d")
+                .short('d')
+                .long("hv-d")
+                .help("Dimension for hypervector")
+                .default_value("4096")
+                .value_parser(value_parser!(usize))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("quant_scale")
+                .short('Q')
+                .long("quant-scale")
+                .help("Scaling factor for HV quantization")
+                .default_value("1.0")
+                .value_parser(value_parser!(f32))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("ani_th")
+                .short('a')
+                .long("ani-th")
+                .help("ANI threshold")
+                .default_value("85.0")
+                .value_parser(value_parser!(f32))
+                .action(ArgAction::Set),
+        )
+        .arg(
+            Arg::new("device")
+                .short('D')
+                .long("device")
+                .help("Device to run on")
+                .default_value("cpu")
+                .value_parser(["cpu", "gpu"])
+                .action(ArgAction::Set),
+        );
+
+    let matches = Command::new("dotani")
+        .version(params::VERSION)
+        .about("DotANI: Ultra-fast and memory-efficient ANI estimation in hyperdimensional space via DotHash and UltraLogLog, with GPU acceleration")
+        .arg_required_else_help(true)
+        .subcommand_required(true)
+        .subcommand(sketch_cmd)
+        .subcommand(dist_cmd)
+        .subcommand(search_cmd)
+        .get_matches();
+
+    if let Some(sketch_m) = matches.subcommand_matches(params::CMD_SKETCH) {
+        let cli_params = types::CliParams {
+            mode: params::CMD_SKETCH.to_string(),
+            path: sketch_m.get_one::<PathBuf>("path").cloned().unwrap(),
+            path_ref_sketch: PathBuf::new(),
+            path_query_sketch: PathBuf::new(),
+            out_file: sketch_m.get_one::<PathBuf>("out").cloned().unwrap(),
+            ksize: *sketch_m.get_one::<u8>("ksize").unwrap(),
+            sketch_method: sketch_m
+                .get_one::<String>("sketch_method")
+                .cloned()
+                .unwrap(),
+            canonical: *sketch_m.get_one::<bool>("canonical").unwrap(),
+            seed: *sketch_m.get_one::<u64>("seed").unwrap(),
+            scaled: *sketch_m.get_one::<u64>("scaled").unwrap(),
+            hv_d: *sketch_m.get_one::<usize>("hv_d").unwrap(),
+            hv_quant_scale: *sketch_m.get_one::<f32>("quant_scale").unwrap(),
+            ani_threshold: *sketch_m.get_one::<f32>("ani_th").unwrap(),
+            if_compressed: true,
+            threads: *sketch_m.get_one::<u8>("thread").unwrap(),
+            device: sketch_m.get_one::<String>("device").cloned().unwrap(),
+            if_ull: *sketch_m.get_one::<bool>("ull").unwrap(),
+            ull_p: *sketch_m.get_one::<u32>("ull_p").unwrap(),
+            ull_out_file: sketch_m
+                .get_one::<PathBuf>("ull_out")
+                .cloned()
+                .unwrap_or_else(|| {
+                    let mut p = sketch_m.get_one::<PathBuf>("out").cloned().unwrap();
+                    p.set_extension("ull");
+                    p
+                }),
+            path_ref_ull: PathBuf::new(),
+            path_query_ull: PathBuf::new(),
+        };
+
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(cli_params.threads as usize)
+            .build_global()
+            .unwrap();
+
+        let sketch_params = types::SketchParams::new(&cli_params);
+
+        if sketch_params.device == "gpu" {
+            sketch_cuda::sketch_cuda(sketch_params);
+        } else {
+            sketch::sketch(sketch_params);
         }
-    }
+    } else if let Some(dist_m) = matches.subcommand_matches(params::CMD_DIST) {
+        let cli_params = types::CliParams {
+            mode: params::CMD_DIST.to_string(),
+            path: PathBuf::new(),
+            path_ref_sketch: dist_m.get_one::<PathBuf>("path_r").cloned().unwrap(),
+            path_query_sketch: dist_m.get_one::<PathBuf>("path_q").cloned().unwrap(),
+            out_file: dist_m.get_one::<PathBuf>("out").cloned().unwrap(),
+            ksize: *dist_m.get_one::<u8>("ksize").unwrap(),
+            sketch_method: dist_m
+                .get_one::<String>("sketch_method")
+                .cloned()
+                .unwrap(),
+            canonical: *dist_m.get_one::<bool>("canonical").unwrap(),
+            seed: *dist_m.get_one::<u64>("seed").unwrap(),
+            scaled: *dist_m.get_one::<u64>("scaled").unwrap(),
+            hv_d: *dist_m.get_one::<usize>("hv_d").unwrap(),
+            hv_quant_scale: *dist_m.get_one::<f32>("quant_scale").unwrap(),
+            ani_threshold: *dist_m.get_one::<f32>("ani_th").unwrap(),
+            if_compressed: true,
+            threads: *dist_m.get_one::<u8>("thread").unwrap(),
+            device: dist_m.get_one::<String>("device").cloned().unwrap(),
+            if_ull: true,
+            ull_p: 0,
+            ull_out_file: PathBuf::new(),
+            path_ref_ull: dist_m.get_one::<PathBuf>("path_r_ull").cloned().unwrap(),
+            path_query_ull: dist_m.get_one::<PathBuf>("path_q_ull").cloned().unwrap(),
+        };
 
-    hv_decompressed
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(cli_params.threads as usize)
+            .build_global()
+            .unwrap();
+
+        let mut sketch_dist = types::SketchDist::new(&cli_params);
+        dist::dist(&mut sketch_dist);
+    } else if let Some(search_m) = matches.subcommand_matches(params::CMD_SEARCH) {
+        let cli_params = types::CliParams {
+            mode: params::CMD_SEARCH.to_string(),
+            path: search_m
+                .get_one::<PathBuf>("path")
+                .cloned()
+                .unwrap_or_default(),
+            path_ref_sketch: search_m
+                .get_one::<PathBuf>("path_r")
+                .cloned()
+                .unwrap_or_default(),
+            path_query_sketch: search_m
+                .get_one::<PathBuf>("path_q")
+                .cloned()
+                .unwrap_or_default(),
+            out_file: search_m
+                .get_one::<PathBuf>("out")
+                .cloned()
+                .unwrap_or_default(),
+            ksize: *search_m.get_one::<u8>("ksize").unwrap(),
+            sketch_method: search_m
+                .get_one::<String>("sketch_method")
+                .cloned()
+                .unwrap(),
+            canonical: *search_m.get_one::<bool>("canonical").unwrap(),
+            seed: *search_m.get_one::<u64>("seed").unwrap(),
+            scaled: *search_m.get_one::<u64>("scaled").unwrap(),
+            hv_d: *search_m.get_one::<usize>("hv_d").unwrap(),
+            hv_quant_scale: *search_m.get_one::<f32>("quant_scale").unwrap(),
+            ani_threshold: *search_m.get_one::<f32>("ani_th").unwrap(),
+            if_compressed: true,
+            threads: *search_m.get_one::<u8>("thread").unwrap(),
+            device: search_m.get_one::<String>("device").cloned().unwrap(),
+            if_ull: false,
+            ull_p: 0,
+            ull_out_file: PathBuf::new(),
+            path_ref_ull: PathBuf::new(),
+            path_query_ull: PathBuf::new(),
+        };
+
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(cli_params.threads as usize)
+            .build_global()
+            .unwrap();
+
+        // TODO: support search
+        let _ = cli_params;
+    } else {
+        unreachable!("clap should ensure we don't get here");
+    }
 }
