@@ -120,9 +120,11 @@ pub fn compute_pairwise_ani_with_ull(
     q: &[i16],
     card_r: f64,
     card_q: f64,
+    hv_d: usize,
     ksize: u8,
 ) -> f32 {
-    let inter_hat = compute_pairwise_dot(r, q) as f64;
+    let dot = compute_pairwise_dot(r, q) as f64;
+    let inter_hat = dot / (hv_d as f64);
 
     if inter_hat <= 0.0 {
         return 0.0;
@@ -216,14 +218,17 @@ pub unsafe fn compute_pairwise_dot_avx2(r: &[i16], q: &[i16]) -> i32 {
 }
 
 #[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2")]
 pub unsafe fn compute_pairwise_ani_with_ull_avx2(
     r: &[i16],
     q: &[i16],
     card_r: f64,
     card_q: f64,
+    hv_d: usize,
     ksize: u8,
 ) -> f32 {
-    let inter_hat = compute_pairwise_dot_avx2(r, q) as f64;
+    let dot = compute_pairwise_dot_avx2(r, q) as f64;
+    let inter_hat = dot / (hv_d as f64);
 
     if inter_hat <= 0.0 {
         return 0.0;
@@ -304,21 +309,23 @@ pub fn compute_hv_ani(
             let ani = if is_x86_feature_detected!("avx2") {
                 unsafe {
                     compute_pairwise_ani_with_ull_avx2(
-                        &ref_filesketch[ind.0].hv,
-                        &query_filesketch[ind.1].hv,
-                        ref_cards[ind.0],
-                        query_cards[ind.1],
-                        ksize,
-                    )
-                }
-            } else {
-                compute_pairwise_ani_with_ull(
                     &ref_filesketch[ind.0].hv,
                     &query_filesketch[ind.1].hv,
                     ref_cards[ind.0],
                     query_cards[ind.1],
+                    ref_filesketch[ind.0].hv_d,
                     ksize,
                 )
+                }
+            } else {
+                compute_pairwise_ani_with_ull(
+                &ref_filesketch[ind.0].hv,
+                &query_filesketch[ind.1].hv,
+                ref_cards[ind.0],
+                query_cards[ind.1],
+                ref_filesketch[ind.0].hv_d,
+                ksize,
+            )
             };
 
             *file_ani_pair = (
