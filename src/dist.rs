@@ -7,7 +7,6 @@ use crate::utils;
 use log::info;
 use rayon::prelude::*;
 
-use std::arch::x86_64::*;
 use std::time::Instant;
 
 pub fn dist(sketch_dist: &mut SketchDist) {
@@ -97,8 +96,7 @@ pub fn dist(sketch_dist: &mut SketchDist) {
     );
 }
 
-// This is still stored into FileSketch.hv_norm_2 (i32) elsewhere.
-// Keep it here for compatibility, but compute in i64 first to avoid intermediate overflow.
+// Kept for compatibility
 pub fn compute_hv_l2_norm(hv: &Vec<i16>) -> i32 {
     let sum_i64: i64 = hv
         .iter()
@@ -163,109 +161,6 @@ pub fn compute_pairwise_ani_with_ull(
     }
 }
 
-#[target_feature(enable = "avx2")]
-pub unsafe fn compute_pairwise_dot_avx2(r: &[i16], q: &[i16]) -> i64 {
-    assert_eq!(r.len(), q.len());
-
-    let len = r.len();
-    let n16 = len / 16;
-    let mut dot_r_q: i64 = 0;
-
-    for i in 0..n16 {
-        let base = i * 16;
-
-        let mm256_r = _mm256_set_epi16(
-            r[base + 0],
-            r[base + 1],
-            r[base + 2],
-            r[base + 3],
-            r[base + 4],
-            r[base + 5],
-            r[base + 6],
-            r[base + 7],
-            r[base + 8],
-            r[base + 9],
-            r[base + 10],
-            r[base + 11],
-            r[base + 12],
-            r[base + 13],
-            r[base + 14],
-            r[base + 15],
-        );
-
-        let mm256_q = _mm256_set_epi16(
-            q[base + 0],
-            q[base + 1],
-            q[base + 2],
-            q[base + 3],
-            q[base + 4],
-            q[base + 5],
-            q[base + 6],
-            q[base + 7],
-            q[base + 8],
-            q[base + 9],
-            q[base + 10],
-            q[base + 11],
-            q[base + 12],
-            q[base + 13],
-            q[base + 14],
-            q[base + 15],
-        );
-
-        let mm256_madd_32x8 = _mm256_madd_epi16(mm256_r, mm256_q);
-        let mm256_madd_32x4 = _mm256_hadd_epi32(mm256_madd_32x8, _mm256_setzero_si256());
-
-        let dot = (_mm256_extract_epi32::<0>(mm256_madd_32x4) as i64)
-            + (_mm256_extract_epi32::<1>(mm256_madd_32x4) as i64)
-            + (_mm256_extract_epi32::<4>(mm256_madd_32x4) as i64)
-            + (_mm256_extract_epi32::<5>(mm256_madd_32x4) as i64);
-
-        dot_r_q += dot;
-    }
-
-    // tail
-    for i in (n16 * 16)..len {
-        dot_r_q += (r[i] as i64) * (q[i] as i64);
-    }
-
-    dot_r_q
-}
-
-#[target_feature(enable = "avx2")]
-pub unsafe fn compute_pairwise_ani_with_ull_avx2(
-    r: &[i16],
-    q: &[i16],
-    card_r: f64,
-    card_q: f64,
-    hv_d: usize,
-    ksize: u8,
-) -> f32 {
-    let dot = compute_pairwise_dot_avx2(r, q) as f64;
-    let inter_hat = dot / (hv_d as f64);
-
-    if inter_hat <= 0.0 {
-        return 0.0;
-    }
-
-    let union_hat = card_r + card_q - inter_hat;
-    if union_hat <= 0.0 {
-        return 0.0;
-    }
-
-    let jaccard = inter_hat / union_hat;
-    if !jaccard.is_finite() || jaccard <= 0.0 || jaccard > 1.0 {
-        return 0.0;
-    }
-
-    let ani = 1.0 + (2.0 / (1.0 / jaccard as f32 + 1.0)).ln() / (ksize as f32);
-
-    if ani.is_nan() {
-        0.0
-    } else {
-        ani.clamp(0.0, 1.0) * 100.0
-    }
-}
-
 pub fn compute_hv_ani(
     sketch_dist: &mut SketchDist,
     ref_filesketch: &Vec<FileSketch>,
@@ -288,7 +183,7 @@ pub fn compute_hv_ani(
 
     let pb = utils::get_progress_bar(num_dists);
 
-    // Compute ULL cardinalities once per genome in dist
+    // Compute ULL cardinalities once per genome
     let ref_cards: Vec<f64> = ref_ull_sketch
         .par_iter()
         .map(|s| ull_cardinality_from_state(&s.ull_state))
@@ -317,35 +212,51 @@ pub fn compute_hv_ani(
     sketch_dist
         .file_ani
         .par_iter_mut()
+        .enumerate()
         .zip(index_dist.into_par_iter())
-        .for_each(|(file_ani_pair, ind)| {
-            let ani = if is_x86_feature_detected!("avx2") {
-                unsafe {
-                    compute_pairwise_ani_with_ull_avx2(
-                        &ref_filesketch[ind.0].hv,
-                        &query_filesketch[ind.1].hv,
-                        ref_cards[ind.0],
-                        query_cards[ind.1],
-                        ref_filesketch[ind.0].hv_d,
-                        ksize,
-                    )
-                }
+        .for_each(|((pair_idx, file_ani_pair), ind)| {
+            let r = &ref_filesketch[ind.0];
+            let q = &query_filesketch[ind.1];
+
+            let card_r = ref_cards[ind.0];
+            let card_q = query_cards[ind.1];
+
+            let dot = compute_pairwise_dot(&r.hv, &q.hv) as f64;
+            let inter_hat = dot / (r.hv_d as f64);
+            let union_hat = card_r + card_q - inter_hat;
+            let jaccard = if union_hat > 0.0 {
+                inter_hat / union_hat
             } else {
-                compute_pairwise_ani_with_ull(
-                    &ref_filesketch[ind.0].hv,
-                    &query_filesketch[ind.1].hv,
-                    ref_cards[ind.0],
-                    query_cards[ind.1],
-                    ref_filesketch[ind.0].hv_d,
-                    ksize,
-                )
+                -1.0
             };
 
+            let ani = compute_pairwise_ani_with_ull(
+                &r.hv,
+                &q.hv,
+                card_r,
+                card_q,
+                r.hv_d,
+                ksize,
+            );
+
+            if pair_idx < 8 {
+                info!(
+                    "DEBUG pair {}: {} vs {} | card_r={:.3} card_q={:.3} dot={:.3} inter_hat={:.3} union_hat={:.3} jaccard={:.6} ani={:.3}",
+                    pair_idx,
+                    r.file_str,
+                    q.file_str,
+                    card_r,
+                    card_q,
+                    dot,
+                    inter_hat,
+                    union_hat,
+                    jaccard,
+                    ani
+                );
+            }
+
             *file_ani_pair = (
-                (
-                    ref_filesketch[ind.0].file_str.clone(),
-                    query_filesketch[ind.1].file_str.clone(),
-                ),
+                (r.file_str.clone(), q.file_str.clone()),
                 ani,
             );
 
