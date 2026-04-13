@@ -2,7 +2,8 @@ use crate::types::*;
 
 #[cfg(feature = "cuda-sketch")]
 use {
-    crate::{dist, fastx_reader, hd, ultraloglog::UltraLogLog;::UltraLogLog, utils},
+    crate::{dist, fastx_reader, hd, utils},
+    ultraloglog::UltraLogLog
     cudarc::{
         driver::{CudaContext, LaunchConfig, PushKernelArg},
         nvrtc::Ptx,
