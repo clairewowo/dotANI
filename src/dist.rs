@@ -1,13 +1,14 @@
 use ultraloglog::UltraLogLog;
+
 use crate::hd;
 use crate::types::*;
 use crate::utils;
-use std::time::Instant;
 
 use log::info;
 use rayon::prelude::*;
 
 use std::arch::x86_64::*;
+use std::time::Instant;
 
 pub fn dist(sketch_dist: &mut SketchDist) {
     let tstart = Instant::now();
@@ -96,9 +97,22 @@ pub fn dist(sketch_dist: &mut SketchDist) {
     );
 }
 
+// This is still stored into FileSketch.hv_norm_2 (i32) elsewhere.
+// Keep it here for compatibility, but compute in i64 first to avoid intermediate overflow.
 pub fn compute_hv_l2_norm(hv: &Vec<i16>) -> i32 {
-    hv.iter()
-        .fold(0, |sum: i32, &num| sum + (num as i32 * num as i32))
+    let sum_i64: i64 = hv
+        .iter()
+        .map(|&num| {
+            let x = num as i64;
+            x * x
+        })
+        .sum();
+
+    if sum_i64 > i32::MAX as i64 {
+        i32::MAX
+    } else {
+        sum_i64 as i32
+    }
 }
 
 #[inline]
@@ -108,10 +122,10 @@ pub fn ull_cardinality_from_state(state: &[u8]) -> f64 {
 }
 
 #[inline]
-pub fn compute_pairwise_dot(r: &[i16], q: &[i16]) -> i32 {
+pub fn compute_pairwise_dot(r: &[i16], q: &[i16]) -> i64 {
     r.iter()
         .zip(q.iter())
-        .map(|(x, y)| (*x as i32) * (*y as i32))
+        .map(|(x, y)| (*x as i64) * (*y as i64))
         .sum()
 }
 
@@ -150,12 +164,12 @@ pub fn compute_pairwise_ani_with_ull(
 }
 
 #[target_feature(enable = "avx2")]
-pub unsafe fn compute_pairwise_dot_avx2(r: &[i16], q: &[i16]) -> i32 {
+pub unsafe fn compute_pairwise_dot_avx2(r: &[i16], q: &[i16]) -> i64 {
     assert_eq!(r.len(), q.len());
 
     let len = r.len();
     let n16 = len / 16;
-    let mut dot_r_q: i32 = 0;
+    let mut dot_r_q: i64 = 0;
 
     for i in 0..n16 {
         let base = i * 16;
@@ -201,23 +215,22 @@ pub unsafe fn compute_pairwise_dot_avx2(r: &[i16], q: &[i16]) -> i32 {
         let mm256_madd_32x8 = _mm256_madd_epi16(mm256_r, mm256_q);
         let mm256_madd_32x4 = _mm256_hadd_epi32(mm256_madd_32x8, _mm256_setzero_si256());
 
-        let dot = _mm256_extract_epi32::<0>(mm256_madd_32x4)
-            + _mm256_extract_epi32::<1>(mm256_madd_32x4)
-            + _mm256_extract_epi32::<4>(mm256_madd_32x4)
-            + _mm256_extract_epi32::<5>(mm256_madd_32x4);
+        let dot = (_mm256_extract_epi32::<0>(mm256_madd_32x4) as i64)
+            + (_mm256_extract_epi32::<1>(mm256_madd_32x4) as i64)
+            + (_mm256_extract_epi32::<4>(mm256_madd_32x4) as i64)
+            + (_mm256_extract_epi32::<5>(mm256_madd_32x4) as i64);
 
         dot_r_q += dot;
     }
 
     // tail
     for i in (n16 * 16)..len {
-        dot_r_q += r[i] as i32 * q[i] as i32;
+        dot_r_q += (r[i] as i64) * (q[i] as i64);
     }
 
     dot_r_q
 }
 
-#[target_feature(enable = "avx2")]
 #[target_feature(enable = "avx2")]
 pub unsafe fn compute_pairwise_ani_with_ull_avx2(
     r: &[i16],
@@ -290,7 +303,7 @@ pub fn compute_hv_ani(
             .collect()
     };
 
-    let mut cnt = 0;
+    let mut cnt = 0usize;
     let mut index_dist = vec![(0usize, 0usize); num_dists];
     for i in 0..num_ref_files {
         for j in (if if_symmetric { i + 1 } else { 0 })..num_query_files {
@@ -309,6 +322,16 @@ pub fn compute_hv_ani(
             let ani = if is_x86_feature_detected!("avx2") {
                 unsafe {
                     compute_pairwise_ani_with_ull_avx2(
+                        &ref_filesketch[ind.0].hv,
+                        &query_filesketch[ind.1].hv,
+                        ref_cards[ind.0],
+                        query_cards[ind.1],
+                        ref_filesketch[ind.0].hv_d,
+                        ksize,
+                    )
+                }
+            } else {
+                compute_pairwise_ani_with_ull(
                     &ref_filesketch[ind.0].hv,
                     &query_filesketch[ind.1].hv,
                     ref_cards[ind.0],
@@ -316,16 +339,6 @@ pub fn compute_hv_ani(
                     ref_filesketch[ind.0].hv_d,
                     ksize,
                 )
-                }
-            } else {
-                compute_pairwise_ani_with_ull(
-                &ref_filesketch[ind.0].hv,
-                &query_filesketch[ind.1].hv,
-                ref_cards[ind.0],
-                query_cards[ind.1],
-                ref_filesketch[ind.0].hv_d,
-                ksize,
-            )
             };
 
             *file_ani_pair = (
