@@ -93,7 +93,7 @@ pub fn dist(sketch_dist: &mut SketchDist) {
     );
 }
 
-pub fn compute_hv_l2_norm(hv: &Vec<i32>) -> i64 {
+pub fn compute_hv_l2_norm(hv: &[i32]) -> i64 {
     hv.iter()
         .map(|&num| {
             let x = num as i64;
@@ -123,26 +123,39 @@ pub unsafe fn compute_pairwise_dot_avx2(r: &[i32], q: &[i32]) -> i64 {
 
     let len = r.len();
     let n8 = len / 8;
-    let mut acc: i64 = 0;
+
+    let mut acc_even = _mm256_setzero_si256();
+    let mut acc_odd = _mm256_setzero_si256();
 
     for i in 0..n8 {
         let base = i * 8;
 
-        let vr = unsafe { _mm256_loadu_si256(r.as_ptr().add(base) as *const __m256i) };
-        let vq = unsafe { _mm256_loadu_si256(q.as_ptr().add(base) as *const __m256i) };
-        let vmul = _mm256_mullo_epi32(vr, vq);
+        let vr = _mm256_loadu_si256(r.as_ptr().add(base) as *const __m256i);
+        let vq = _mm256_loadu_si256(q.as_ptr().add(base) as *const __m256i);
 
-        let mut tmp = [0i32; 8];
-        unsafe { _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, vmul) };
+        // Even lanes: indices 0,2,4,6 -> 64-bit products
+        let prod_even = _mm256_mul_epi32(vr, vq);
 
-        acc += tmp.iter().map(|&x| x as i64).sum::<i64>();
+        // Odd lanes: shift each 64-bit lane right by 32 so odd i32 becomes even-positioned
+        let vr_shift = _mm256_srli_epi64(vr, 32);
+        let vq_shift = _mm256_srli_epi64(vq, 32);
+        let prod_odd = _mm256_mul_epi32(vr_shift, vq_shift);
+
+        acc_even = _mm256_add_epi64(acc_even, prod_even);
+        acc_odd = _mm256_add_epi64(acc_odd, prod_odd);
     }
+
+    let acc = _mm256_add_epi64(acc_even, acc_odd);
+    let mut tmp = [0i64; 4];
+    _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, acc);
+
+    let mut sum = tmp.iter().sum::<i64>();
 
     for i in (n8 * 8)..len {
-        acc += (r[i] as i64) * (q[i] as i64);
+        sum += (r[i] as i64) * (q[i] as i64);
     }
 
-    acc
+    sum
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -152,26 +165,69 @@ pub unsafe fn compute_pairwise_dot_avx512(r: &[i32], q: &[i32]) -> i64 {
 
     let len = r.len();
     let n16 = len / 16;
-    let mut acc: i64 = 0;
+
+    let mut acc_even = _mm512_setzero_si512();
+    let mut acc_odd = _mm512_setzero_si512();
 
     for i in 0..n16 {
         let base = i * 16;
 
-        let vr = unsafe { _mm512_loadu_si512(r.as_ptr().add(base) as *const __m512i) };
-        let vq = unsafe { _mm512_loadu_si512(q.as_ptr().add(base) as *const __m512i) };
-        let vmul = _mm512_mullo_epi32(vr, vq);
+        let vr = _mm512_loadu_si512(r.as_ptr().add(base) as *const __m512i);
+        let vq = _mm512_loadu_si512(q.as_ptr().add(base) as *const __m512i);
 
-        let mut tmp = [0i32; 16];
-        unsafe { _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, vmul) };
+        // Even lanes: 0,2,4,...,14 -> 8 x i64 products
+        let prod_even = _mm512_mul_epi32(vr, vq);
 
-        acc += tmp.iter().map(|&x| x as i64).sum::<i64>();
+        // Odd lanes: shift within each 64-bit lane so odd i32 becomes even-positioned
+        let vr_shift = _mm512_srli_epi64(vr, 32);
+        let vq_shift = _mm512_srli_epi64(vq, 32);
+        let prod_odd = _mm512_mul_epi32(vr_shift, vq_shift);
+
+        acc_even = _mm512_add_epi64(acc_even, prod_even);
+        acc_odd = _mm512_add_epi64(acc_odd, prod_odd);
     }
+
+    let acc = _mm512_add_epi64(acc_even, acc_odd);
+    let mut tmp = [0i64; 8];
+    _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, acc);
+
+    let mut sum = tmp.iter().sum::<i64>();
 
     for i in (n16 * 16)..len {
-        acc += (r[i] as i64) * (q[i] as i64);
+        sum += (r[i] as i64) * (q[i] as i64);
     }
 
-    acc
+    sum
+}
+
+#[inline]
+pub fn ani_from_intersection_and_cardinalities(
+    inter_hat: f64,
+    card_r: f64,
+    card_q: f64,
+    ksize: u8,
+) -> f32 {
+    if inter_hat <= 0.0 {
+        return 0.0;
+    }
+
+    let union_hat = card_r + card_q - inter_hat;
+    if union_hat <= 0.0 {
+        return 0.0;
+    }
+
+    let jaccard = inter_hat / union_hat;
+    if !jaccard.is_finite() || jaccard <= 0.0 || jaccard > 1.0 {
+        return 0.0;
+    }
+
+    let ani = 1.0 + (2.0 / (1.0 / jaccard as f32 + 1.0)).ln() / (ksize as f32);
+
+    if ani.is_nan() {
+        0.0
+    } else {
+        ani.clamp(0.0, 1.0) * 100.0
+    }
 }
 
 pub fn compute_pairwise_ani_with_ull(
@@ -184,28 +240,7 @@ pub fn compute_pairwise_ani_with_ull(
 ) -> f32 {
     let dot = compute_pairwise_dot(r, q) as f64;
     let inter_hat = dot / hv_d as f64;
-
-    if inter_hat <= 0.0 {
-        return 0.0;
-    }
-
-    let union_hat = card_r + card_q - inter_hat;
-    if union_hat <= 0.0 {
-        return 0.0;
-    }
-
-    let jaccard = inter_hat / union_hat;
-    if !jaccard.is_finite() || jaccard <= 0.0 || jaccard > 1.0 {
-        return 0.0;
-    }
-
-    let ani = 1.0 + (2.0 / (1.0 / jaccard as f32 + 1.0)).ln() / (ksize as f32);
-
-    if ani.is_nan() {
-        0.0
-    } else {
-        ani.clamp(0.0, 1.0) * 100.0
-    }
+    ani_from_intersection_and_cardinalities(inter_hat, card_r, card_q, ksize)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -218,30 +253,9 @@ pub unsafe fn compute_pairwise_ani_with_ull_avx2(
     hv_d: usize,
     ksize: u8,
 ) -> f32 {
-    let dot = unsafe { compute_pairwise_dot_avx2(r, q) } as f64;
+    let dot = compute_pairwise_dot_avx2(r, q) as f64;
     let inter_hat = dot / hv_d as f64;
-
-    if inter_hat <= 0.0 {
-        return 0.0;
-    }
-
-    let union_hat = card_r + card_q - inter_hat;
-    if union_hat <= 0.0 {
-        return 0.0;
-    }
-
-    let jaccard = inter_hat / union_hat;
-    if !jaccard.is_finite() || jaccard <= 0.0 || jaccard > 1.0 {
-        return 0.0;
-    }
-
-    let ani = 1.0 + (2.0 / (1.0 / jaccard as f32 + 1.0)).ln() / (ksize as f32);
-
-    if ani.is_nan() {
-        0.0
-    } else {
-        ani.clamp(0.0, 1.0) * 100.0
-    }
+    ani_from_intersection_and_cardinalities(inter_hat, card_r, card_q, ksize)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -254,38 +268,17 @@ pub unsafe fn compute_pairwise_ani_with_ull_avx512(
     hv_d: usize,
     ksize: u8,
 ) -> f32 {
-    let dot = unsafe { compute_pairwise_dot_avx512(r, q) } as f64;
+    let dot = compute_pairwise_dot_avx512(r, q) as f64;
     let inter_hat = dot / hv_d as f64;
-
-    if inter_hat <= 0.0 {
-        return 0.0;
-    }
-
-    let union_hat = card_r + card_q - inter_hat;
-    if union_hat <= 0.0 {
-        return 0.0;
-    }
-
-    let jaccard = inter_hat / union_hat;
-    if !jaccard.is_finite() || jaccard <= 0.0 || jaccard > 1.0 {
-        return 0.0;
-    }
-
-    let ani = 1.0 + (2.0 / (1.0 / jaccard as f32 + 1.0)).ln() / (ksize as f32);
-
-    if ani.is_nan() {
-        0.0
-    } else {
-        ani.clamp(0.0, 1.0) * 100.0
-    }
+    ani_from_intersection_and_cardinalities(inter_hat, card_r, card_q, ksize)
 }
 
 pub fn compute_hv_ani(
     sketch_dist: &mut SketchDist,
-    ref_filesketch: &Vec<FileSketch>,
-    query_filesketch: &Vec<FileSketch>,
-    ref_ull_sketch: &Vec<FileUllSketch>,
-    query_ull_sketch: &Vec<FileUllSketch>,
+    ref_filesketch: &[FileSketch],
+    query_filesketch: &[FileSketch],
+    ref_ull_sketch: &[FileUllSketch],
+    query_ull_sketch: &[FileUllSketch],
     ksize: u8,
     if_symmetric: bool,
 ) {
@@ -339,53 +332,45 @@ pub fn compute_hv_ani(
             let card_r = ref_cards[ind.0];
             let card_q = query_cards[ind.1];
 
-            let ani = {
+            let (dot, ani) = {
                 #[cfg(target_arch = "x86_64")]
                 {
                     if is_x86_feature_detected!("avx512f") {
-                        unsafe {
+                        let dot = unsafe { compute_pairwise_dot_avx512(&r.hv, &q.hv) as f64 };
+                        let ani = unsafe {
                             compute_pairwise_ani_with_ull_avx512(
                                 &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
                             )
-                        }
+                        };
+                        (dot, ani)
                     } else if is_x86_feature_detected!("avx2") {
-                        unsafe {
+                        let dot = unsafe { compute_pairwise_dot_avx2(&r.hv, &q.hv) as f64 };
+                        let ani = unsafe {
                             compute_pairwise_ani_with_ull_avx2(
                                 &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
                             )
-                        }
+                        };
+                        (dot, ani)
                     } else {
-                        compute_pairwise_ani_with_ull(
+                        let dot = compute_pairwise_dot(&r.hv, &q.hv) as f64;
+                        let ani = compute_pairwise_ani_with_ull(
                             &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
-                        )
+                        );
+                        (dot, ani)
                     }
                 }
 
                 #[cfg(not(target_arch = "x86_64"))]
                 {
-                    compute_pairwise_ani_with_ull(&r.hv, &q.hv, card_r, card_q, r.hv_d, ksize)
+                    let dot = compute_pairwise_dot(&r.hv, &q.hv) as f64;
+                    let ani = compute_pairwise_ani_with_ull(
+                        &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
+                    );
+                    (dot, ani)
                 }
             };
 
             if pair_idx < 8 {
-                let dot = {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        if is_x86_feature_detected!("avx512f") {
-                            unsafe { compute_pairwise_dot_avx512(&r.hv, &q.hv) as f64 }
-                        } else if is_x86_feature_detected!("avx2") {
-                            unsafe { compute_pairwise_dot_avx2(&r.hv, &q.hv) as f64 }
-                        } else {
-                            compute_pairwise_dot(&r.hv, &q.hv) as f64
-                        }
-                    }
-
-                    #[cfg(not(target_arch = "x86_64"))]
-                    {
-                        compute_pairwise_dot(&r.hv, &q.hv) as f64
-                    }
-                };
-
                 let inter_hat = dot / r.hv_d as f64;
                 let union_hat = card_r + card_q - inter_hat;
                 let jaccard = if union_hat > 0.0 {

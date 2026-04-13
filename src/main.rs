@@ -198,84 +198,12 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
-            Arg::new("sketch_method")
-                .short('m')
-                .long("sketch-method")
-                .help("Sketch method")
-                .default_value("fracminhash")
-                .value_parser(value_parser!(String))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("canonical")
-                .short('C')
-                .long("canonical")
-                .help("Whether to use canonical k-mers")
-                .default_value("true")
-                .value_parser(value_parser!(bool))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("ksize")
-                .short('k')
-                .long("ksize")
-                .help("k-mer size for sketching")
-                .default_value("21")
-                .value_parser(value_parser!(u8))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("seed")
-                .short('S')
-                .long("seed")
-                .help("Hash seed")
-                .default_value("123")
-                .value_parser(value_parser!(u64))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("scaled")
-                .short('s')
-                .long("scaled")
-                .help("Scaled factor for FracMinHash")
-                .default_value("1500")
-                .value_parser(value_parser!(u64))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("hv_d")
-                .short('d')
-                .long("hv-d")
-                .help("Dimension for hypervector")
-                .default_value("4096")
-                .value_parser(value_parser!(usize))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("quant_scale")
-                .short('Q')
-                .long("quant-scale")
-                .help("Scaling factor for HV quantization")
-                .default_value("1.0")
-                .value_parser(value_parser!(f32))
-                .action(ArgAction::Set),
-        )
-        .arg(
             Arg::new("ani_th")
                 .short('a')
                 .long("ani-th")
                 .help("ANI threshold")
                 .default_value("85.0")
                 .value_parser(value_parser!(f32))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("device")
-                .short('D')
-                .long("device")
-                .help("Device to run on")
-                .default_value("cpu")
-                .value_parser(["cpu", "gpu"])
                 .action(ArgAction::Set),
         );
 
@@ -323,84 +251,12 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
-            Arg::new("sketch_method")
-                .short('m')
-                .long("sketch-method")
-                .help("Sketch method")
-                .default_value("fracminhash")
-                .value_parser(value_parser!(String))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("canonical")
-                .short('C')
-                .long("canonical")
-                .help("Whether to use canonical k-mers")
-                .default_value("true")
-                .value_parser(value_parser!(bool))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("ksize")
-                .short('k')
-                .long("ksize")
-                .help("k-mer size for sketching")
-                .default_value("21")
-                .value_parser(value_parser!(u8))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("seed")
-                .short('S')
-                .long("seed")
-                .help("Hash seed")
-                .default_value("123")
-                .value_parser(value_parser!(u64))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("scaled")
-                .short('s')
-                .long("scaled")
-                .help("Scaled factor for FracMinHash")
-                .default_value("1500")
-                .value_parser(value_parser!(u64))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("hv_d")
-                .short('d')
-                .long("hv-d")
-                .help("Dimension for hypervector")
-                .default_value("4096")
-                .value_parser(value_parser!(usize))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("quant_scale")
-                .short('Q')
-                .long("quant-scale")
-                .help("Scaling factor for HV quantization")
-                .default_value("1.0")
-                .value_parser(value_parser!(f32))
-                .action(ArgAction::Set),
-        )
-        .arg(
             Arg::new("ani_th")
                 .short('a')
                 .long("ani-th")
                 .help("ANI threshold")
                 .default_value("85.0")
                 .value_parser(value_parser!(f32))
-                .action(ArgAction::Set),
-        )
-        .arg(
-            Arg::new("device")
-                .short('D')
-                .long("device")
-                .help("Device to run on")
-                .default_value("cpu")
-                .value_parser(["cpu", "gpu"])
                 .action(ArgAction::Set),
         );
 
@@ -466,20 +322,21 @@ fn main() {
             path_ref_sketch: path_ref_sketch.clone(),
             path_query_sketch: path_query_sketch.clone(),
             out_file: dist_m.get_one::<PathBuf>("out").cloned().unwrap(),
-            ksize: *dist_m.get_one::<u8>("ksize").unwrap(),
-            sketch_method: dist_m
-                .get_one::<String>("sketch_method")
-                .cloned()
-                .unwrap(),
-            canonical: *dist_m.get_one::<bool>("canonical").unwrap(),
-            seed: *dist_m.get_one::<u64>("seed").unwrap(),
-            scaled: *dist_m.get_one::<u64>("scaled").unwrap(),
-            hv_d: *dist_m.get_one::<usize>("hv_d").unwrap(),
-            hv_quant_scale: *dist_m.get_one::<f32>("quant_scale").unwrap(),
+
+            // not needed for dist; loaded from sketch files
+            ksize: 0,
+            sketch_method: String::new(),
+            canonical: true,
+            seed: 0,
+            scaled: 1,
+            hv_d: 0,
+            hv_quant_scale: 1.0,
+
             ani_threshold: *dist_m.get_one::<f32>("ani_th").unwrap(),
             if_compressed: true,
             threads: *dist_m.get_one::<u8>("thread").unwrap(),
-            device: dist_m.get_one::<String>("device").cloned().unwrap(),
+            device: String::from("cpu"),
+
             if_ull: true,
             ull_p: 0,
             ull_out_file: PathBuf::new(),
@@ -516,20 +373,21 @@ fn main() {
                 .get_one::<PathBuf>("out")
                 .cloned()
                 .unwrap_or_default(),
-            ksize: *search_m.get_one::<u8>("ksize").unwrap(),
-            sketch_method: search_m
-                .get_one::<String>("sketch_method")
-                .cloned()
-                .unwrap(),
-            canonical: *search_m.get_one::<bool>("canonical").unwrap(),
-            seed: *search_m.get_one::<u64>("seed").unwrap(),
-            scaled: *search_m.get_one::<u64>("scaled").unwrap(),
-            hv_d: *search_m.get_one::<usize>("hv_d").unwrap(),
-            hv_quant_scale: *search_m.get_one::<f32>("quant_scale").unwrap(),
+
+            // not needed for search either; should come from sketch files/db
+            ksize: 0,
+            sketch_method: String::new(),
+            canonical: true,
+            seed: 0,
+            scaled: 1,
+            hv_d: 0,
+            hv_quant_scale: 1.0,
+
             ani_threshold: *search_m.get_one::<f32>("ani_th").unwrap(),
             if_compressed: true,
             threads: *search_m.get_one::<u8>("thread").unwrap(),
-            device: search_m.get_one::<String>("device").cloned().unwrap(),
+            device: String::from("cpu"),
+
             if_ull: false,
             ull_p: 0,
             ull_out_file: PathBuf::new(),
