@@ -6,7 +6,7 @@ use clap::{value_parser, Arg, ArgAction, Command};
 use env_logger::{Builder, Target};
 use log::LevelFilter;
 
-use dotani::{dist, params, sketch, sketch_cuda, types};
+use dotani::{dist, params, sketch, sketch_cuda, types, dist_cuda};
 
 fn init_log() {
     Builder::new()
@@ -189,6 +189,15 @@ fn main() {
                 .action(ArgAction::Set),
         )
         .arg(
+            Arg::new("device")
+                .short('D')
+                .long("device")
+                .help("Device to run on")
+                .default_value("cpu")
+                .value_parser(["cpu", "gpu"])
+                .action(ArgAction::Set),
+        )
+        .arg(
             Arg::new("thread")
                 .short('t')
                 .long("thread")
@@ -335,7 +344,7 @@ fn main() {
             ani_threshold: *dist_m.get_one::<f32>("ani_th").unwrap(),
             if_compressed: true,
             threads: *dist_m.get_one::<u8>("thread").unwrap(),
-            device: String::from("cpu"),
+            device: *dist_m.get_one::<String>("device").unwrap(),
 
             if_ull: true,
             ull_p: 0,
@@ -350,7 +359,12 @@ fn main() {
             .unwrap();
 
         let mut sketch_dist = types::SketchDist::new(&cli_params);
-        dist::dist(&mut sketch_dist);
+        if device == "cpu" {
+            dist::dist(&mut sketch_dist);
+        }
+        else {
+            dist_cuda::dist(&mut sketch_dist);
+        }
     } else if let Some(search_m) = matches.subcommand_matches(params::CMD_SEARCH) {
         let path_ref_sketch = search_m
             .get_one::<PathBuf>("path_r")

@@ -1,6 +1,6 @@
 use crate::types::*;
 
-#[cfg(feature = "cuda-sketch")]
+#[cfg(feature = "cuda")]
 use {
     crate::{dist, fastx_reader, hd, utils},
     cudarc::{
@@ -16,11 +16,11 @@ use {
     ultraloglog::UltraLogLog,
 };
 
-#[cfg(feature = "cuda-sketch")]
+#[cfg(feature = "cuda")]
 const CUDA_KERNEL_MY_STRUCT: &str =
     include_str!(concat!(env!("OUT_DIR"), "/cuda_kmer_hash.ptx"));
 
-#[cfg(feature = "cuda-sketch")]
+#[cfg(feature = "cuda")]
 const SEQ_NT4_TABLE: [u8; 256] = [
     0, 1, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
     4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
@@ -33,17 +33,17 @@ const SEQ_NT4_TABLE: [u8; 256] = [
 ];
 
 #[allow(unused_variables)]
-#[cfg(not(feature = "cuda-sketch"))]
+#[cfg(not(feature = "cuda"))]
 pub fn sketch_cuda(params: SketchParams) {
     use log::error;
 
     error!(
-        "Cuda sketching is not supported. Please add `--features cuda-sketch` for installation to enable it."
+        "Cuda is not supported. Please add `--features cuda` for installation to enable it."
     );
 }
 
 // Sketch all FASTA files using GPU hashing, then CPU ULL + CPU HD encoding
-#[cfg(all(target_arch = "x86_64", feature = "cuda-sketch"))]
+#[cfg(all(target_arch = "x86_64", feature = "cuda"))]
 pub fn sketch_cuda(params: SketchParams) {
     let files = utils::get_fasta_files(&params.path);
     let n_file = files.len();
@@ -147,7 +147,7 @@ pub fn sketch_cuda(params: SketchParams) {
     }
 }
 
-#[cfg(feature = "cuda-sketch")]
+#[cfg(feature = "cuda")]
 fn extract_kmer_t1ha2_cuda_full_hashes(
     sketch: &FileSketch,
     ctx: &Arc<CudaContext>,
@@ -205,7 +205,7 @@ fn extract_kmer_t1ha2_cuda_full_hashes(
     host_kmer_hash.into_iter().filter(|&h| h != 0).collect()
 }
 
-#[cfg(feature = "cuda-sketch")]
+#[cfg(feature = "cuda")]
 pub fn cuda_mmhash_bitpack_parallel(
     path_fna: &String,
     ksize: usize,
@@ -282,7 +282,7 @@ pub fn cuda_mmhash_bitpack_parallel(
     sketch_kmer_sets
 }
 
-#[cfg(feature = "cuda-sketch")]
+#[cfg(feature = "cuda")]
 pub fn cuda_t1ha2_hash_parallel(
     path_fna: &String,
     ksize: usize,

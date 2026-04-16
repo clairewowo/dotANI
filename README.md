@@ -21,7 +21,7 @@ cargo build --release
 _dotANI_ supports GPU acceleration. Using GPU mode will require the installation of NVIDIA GPU driver. Use `nvidia-smi` or `nvcc -V` to check if the driver is installed. Then run the following command to install with GPU support:
 ```sh
 # With GPU acceleration for sketching, RTX 4090 series as an example
-cargo build --release --features cuda-sketch 
+cargo build --release --features cuda
 
 ```
 

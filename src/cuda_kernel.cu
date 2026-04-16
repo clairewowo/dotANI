@@ -12,6 +12,42 @@ extern "C" __device__ uint64_t mmhash_u64(uint64_t key) {
   return key;
 }
 
+extern "C" __global__ void cuda_dist_dot_product(
+    const int* a,
+    const int* b,
+    long long* partial_sums,
+    int n
+) {
+    __shared__ long long cache[256];  // adjust to blockDim.x
+
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+
+    long long temp = 0;
+
+    while (idx < n) {
+        temp += (long long)a[idx] * b[idx];
+        idx += blockDim.x * gridDim.x;
+    }
+
+    cache[tid] = temp;
+    __syncthreads();
+
+    // reduction in shared memory
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (tid < stride) {
+            cache[tid] += cache[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    // write result of this block
+    if (tid == 0) {
+        partial_sums[blockIdx.x] = cache[0];
+    }
+}
+
+
 extern "C" __global__ void cuda_kmer_bit_pack_mmhash(
     uint8_t *seq, const size_t n_bps, const size_t n_kmer_per_thread,
     const size_t n_hash_per_thread, const size_t ksize,

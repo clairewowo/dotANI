@@ -6,6 +6,7 @@ pub mod sketch;
 pub mod sketch_cuda;
 pub mod types;
 pub mod utils;
+pub mod dist_cuda;
 
 #[cfg(test)]
 mod tests {

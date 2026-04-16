@@ -12,7 +12,7 @@ cc = "1.0.82"
 regex = "1.9.3"
 
 [features]
-cuda-sketch = ["dep:cudarc"]
+cuda = ["dep:cudarc"]
 
 [dependencies]
 log = "0.4.20"

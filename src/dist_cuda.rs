@@ -3,16 +3,20 @@ use ultraloglog::UltraLogLog;
 use crate::hd;
 use crate::types::*;
 use crate::utils;
-
+#[cfg(feature = "cuda")]
+use {
+    cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg},
+    cudarc::nvrtc::compile_ptx
+};
 use log::info;
 use rayon::prelude::*;
 
 use std::time::Instant;
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
-
-pub fn dist(sketch_dist: &mut SketchDist) {
+#[cfg(all(target_arch = "x86_64", feature="cuda"))]
+//use std::arch::x86_64::*;
+//#[cfg(all(target_arch = "x86_64", feature = "cuda-sketch"))]
+pub fn dist_cuda(sketch_dist: &mut SketchDist) {
     let tstart = Instant::now();
     let if_sym = sketch_dist.path_ref_sketch == sketch_dist.path_query_sketch;
 
@@ -80,6 +84,7 @@ pub fn dist(sketch_dist: &mut SketchDist) {
         &ref_ull_sketch,
         &query_ull_sketch,
         ksize_ref,
+        hv_d_ref,
         if_sym,
     );
 
@@ -116,8 +121,8 @@ pub fn compute_pairwise_dot(r: &[i32], q: &[i32]) -> i64 {
         .sum()
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[cfg(all(target_arch = "x86_64", feature="cuda"))]
+//#[target_feature(enable = "avx2")]
 pub unsafe fn compute_pairwise_dot_avx2(r: &[i32], q: &[i32]) -> i64 {
     assert_eq!(r.len(), q.len());
 
@@ -273,6 +278,7 @@ pub unsafe fn compute_pairwise_ani_with_ull_avx512(
     ani_from_intersection_and_cardinalities(inter_hat, card_r, card_q, ksize)
 }
 
+#[cfg(all(target_arch = "x86_64", feature="cuda"))]
 pub fn compute_hv_ani(
     sketch_dist: &mut SketchDist,
     ref_filesketch: &[FileSketch],
@@ -281,6 +287,7 @@ pub fn compute_hv_ani(
     query_ull_sketch: &[FileUllSketch],
     ksize: u8,
     if_symmetric: bool,
+    hv_d: usize
 ) {
     info!("Computing ANI..");
 
@@ -318,58 +325,93 @@ pub fn compute_hv_ani(
         }
     }
 
-    // allocate vector for distances
+    // New module for cuda
+    let ctx = Arc::new(CudaContext::new(0).unwrap());
+    let module = Arc::new(
+        ctx.load_module(Ptx::from_src(CUDA_KERNEL_MY_STRUCT))
+            .unwrap(),
+    );
+
     sketch_dist.file_ani = vec![(("".to_string(), "".to_string()), 0.0); num_dists];
 
-    // compute pairwise distances
     sketch_dist
         .file_ani
         .par_iter_mut()
         .enumerate()
         .zip(index_dist.into_par_iter())
         .for_each(|((pair_idx, file_ani_pair), ind)| {
-            let r = &ref_filesketch[ind.0];
-            let q = &query_filesketch[ind.1];
+
+            let stream = ctx.default_stream();
+            
+            // let r = &ref_filesketch[ind.0];
+            // let q = &query_filesketch[ind.1];
+
+            let gpu_r = stream.clone(&ref_filesketch[ind.0]).unwrap();
+            let gpu_q = stream.clone(&query_filesketch[ind.1]).unwrap();
 
             let card_r = ref_cards[ind.0];
             let card_q = query_cards[ind.1];
 
-            let (dot, ani) = {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    if is_x86_feature_detected!("avx512f") {
-                        let dot = unsafe { compute_pairwise_dot_avx512(&r.hv, &q.hv) as f64 };
-                        let ani = unsafe {
-                            compute_pairwise_ani_with_ull_avx512(
-                                &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
-                            )
-                        };
-                        (dot, ani)
-                    } else if is_x86_feature_detected!("avx2") {
-                        let dot = unsafe { compute_pairwise_dot_avx2(&r.hv, &q.hv) as f64 };
-                        let ani = unsafe {
-                            compute_pairwise_ani_with_ull_avx2(
-                                &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
-                            )
-                        };
-                        (dot, ani)
-                    } else {
-                        let dot = compute_pairwise_dot(&r.hv, &q.hv) as f64;
-                        let ani = compute_pairwise_ani_with_ull(
-                            &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
-                        );
-                        (dot, ani)
-                    }
-                }
+            let f = module.load_function("cuda_dist_dot_product").unwrap();
+            let mut builder = stream.launch_builder(&f);
 
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    let dot = compute_pairwise_dot(&r.hv, &q.hv) as f64;
-                    let ani = compute_pairwise_ani_with_ull(
-                        &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
-                    );
-                    (dot, ani)
+            // temporary value for now
+            let threads_per_block = 256;
+
+            let (dot, ani) = {
+                use crate::dist::ani_from_intersection_and_cardinalities;
+
+                builder.arg(&gpu_r);
+                builder.arg(&gpu_q);
+                let n = &gpu_r.len();
+                let num_blocks = ceil(n / threads_per_block);
+                let mut gpu_out = stream.alloc_zeros::<i64>(n).unwrap();
+                builder.arg(&gpu_out);
+                builder.arg(&n);
+
+                unsafe {
+                    builder
+                        .launch(LaunchConfig::for_num_elems(threads_per_block as u32))
+                        .unwrap();
                 }
+                let dot = stream.clone_dtoh(&gpu_out).unwrap().iter().sum() / hv_d;
+                let card_r = ref_cards[ind.0];
+                let card_q = query_cards[ind.1];
+                let ani = ani_from_intersection_and_cardinalities(dot, card_r, card_q, ksize);
+                (dot, ani)
+                    // if is_x86_feature_detected!("avx512f") {
+                    //     let dot = unsafe { compute_pairwise_dot_avx512(&r.hv, &q.hv) as f64 };
+                    //     let ani = unsafe {
+                    //         compute_pairwise_ani_with_ull_avx512(
+                    //             &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
+                    //         )
+                    //     };
+                    //     (dot, ani)
+                    // } else if is_x86_feature_detected!("avx2") {
+                    //     let dot = unsafe { compute_pairwise_dot_avx2(&r.hv, &q.hv) as f64 };
+                    //     let ani = unsafe {
+                    //         compute_pairwise_ani_with_ull_avx2(
+                    //             &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
+                    //         )
+                    //     };
+                    //     (dot, ani)
+                    // } else {
+                    //     let dot = compute_pairwise_dot(&r.hv, &q.hv) as f64;
+                    //     let ani = compute_pairwise_ani_with_ull(
+                    //         &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
+                    //     );
+                    //     (dot, ani)
+                    // }
+                
+
+                // #[cfg(not(target_arch = "x86_64"))]
+                // {
+                //     let dot = compute_pairwise_dot(&r.hv, &q.hv) as f64;
+                //     let ani = compute_pairwise_ani_with_ull(
+                //         &r.hv, &q.hv, card_r, card_q, r.hv_d, ksize,
+                //     );
+                //     (dot, ani)
+                // }
             };
 
             if pair_idx < 8 {
