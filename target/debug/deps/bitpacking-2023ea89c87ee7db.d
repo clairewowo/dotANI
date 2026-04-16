@@ -1,0 +1,10 @@
+/Users/claire/Documents/Rust/my_dotANI/target/debug/deps/bitpacking-2023ea89c87ee7db.d: /Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/lib.rs /Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros.rs /Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros_simple.rs /Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker1x_simple.rs /Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker4x_simple.rs /Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker8x.rs
+
+/Users/claire/Documents/Rust/my_dotANI/target/debug/deps/libbitpacking-2023ea89c87ee7db.rmeta: /Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/lib.rs /Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros.rs /Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros_simple.rs /Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker1x_simple.rs /Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker4x_simple.rs /Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker8x.rs
+
+/Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/lib.rs:
+/Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros.rs:
+/Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros_simple.rs:
+/Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker1x_simple.rs:
+/Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker4x_simple.rs:
+/Users/claire/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker8x.rs:

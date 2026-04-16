@@ -121,48 +121,6 @@ pub fn compute_pairwise_dot(r: &[i32], q: &[i32]) -> i64 {
         .sum()
 }
 
-#[cfg(all(target_arch = "x86_64", feature="cuda"))]
-//#[target_feature(enable = "avx2")]
-pub unsafe fn compute_pairwise_dot_avx2(r: &[i32], q: &[i32]) -> i64 {
-    assert_eq!(r.len(), q.len());
-
-    let len = r.len();
-    let n8 = len / 8;
-
-    let mut acc_even = _mm256_setzero_si256();
-    let mut acc_odd = _mm256_setzero_si256();
-
-    for i in 0..n8 {
-        let base = i * 8;
-
-        let vr = _mm256_loadu_si256(r.as_ptr().add(base) as *const __m256i);
-        let vq = _mm256_loadu_si256(q.as_ptr().add(base) as *const __m256i);
-
-        // Even lanes: indices 0,2,4,6 -> 64-bit products
-        let prod_even = _mm256_mul_epi32(vr, vq);
-
-        // Odd lanes: shift each 64-bit lane right by 32 so odd i32 becomes even-positioned
-        let vr_shift = _mm256_srli_epi64(vr, 32);
-        let vq_shift = _mm256_srli_epi64(vq, 32);
-        let prod_odd = _mm256_mul_epi32(vr_shift, vq_shift);
-
-        acc_even = _mm256_add_epi64(acc_even, prod_even);
-        acc_odd = _mm256_add_epi64(acc_odd, prod_odd);
-    }
-
-    let acc = _mm256_add_epi64(acc_even, acc_odd);
-    let mut tmp = [0i64; 4];
-    _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, acc);
-
-    let mut sum = tmp.iter().sum::<i64>();
-
-    for i in (n8 * 8)..len {
-        sum += (r[i] as i64) * (q[i] as i64);
-    }
-
-    sum
-}
-
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub unsafe fn compute_pairwise_dot_avx512(r: &[i32], q: &[i32]) -> i64 {
@@ -244,36 +202,6 @@ pub fn compute_pairwise_ani_with_ull(
     ksize: u8,
 ) -> f32 {
     let dot = compute_pairwise_dot(r, q) as f64;
-    let inter_hat = dot / hv_d as f64;
-    ani_from_intersection_and_cardinalities(inter_hat, card_r, card_q, ksize)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-pub unsafe fn compute_pairwise_ani_with_ull_avx2(
-    r: &[i32],
-    q: &[i32],
-    card_r: f64,
-    card_q: f64,
-    hv_d: usize,
-    ksize: u8,
-) -> f32 {
-    let dot = compute_pairwise_dot_avx2(r, q) as f64;
-    let inter_hat = dot / hv_d as f64;
-    ani_from_intersection_and_cardinalities(inter_hat, card_r, card_q, ksize)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-pub unsafe fn compute_pairwise_ani_with_ull_avx512(
-    r: &[i32],
-    q: &[i32],
-    card_r: f64,
-    card_q: f64,
-    hv_d: usize,
-    ksize: u8,
-) -> f32 {
-    let dot = compute_pairwise_dot_avx512(r, q) as f64;
     let inter_hat = dot / hv_d as f64;
     ani_from_intersection_and_cardinalities(inter_hat, card_r, card_q, ksize)
 }
