@@ -121,48 +121,6 @@ pub fn compute_pairwise_dot(r: &[i32], q: &[i32]) -> i64 {
         .sum()
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-pub unsafe fn compute_pairwise_dot_avx512(r: &[i32], q: &[i32]) -> i64 {
-    assert_eq!(r.len(), q.len());
-
-    let len = r.len();
-    let n16 = len / 16;
-
-    let mut acc_even = _mm512_setzero_si512();
-    let mut acc_odd = _mm512_setzero_si512();
-
-    for i in 0..n16 {
-        let base = i * 16;
-
-        let vr = _mm512_loadu_si512(r.as_ptr().add(base) as *const __m512i);
-        let vq = _mm512_loadu_si512(q.as_ptr().add(base) as *const __m512i);
-
-        // Even lanes: 0,2,4,...,14 -> 8 x i64 products
-        let prod_even = _mm512_mul_epi32(vr, vq);
-
-        // Odd lanes: shift within each 64-bit lane so odd i32 becomes even-positioned
-        let vr_shift = _mm512_srli_epi64(vr, 32);
-        let vq_shift = _mm512_srli_epi64(vq, 32);
-        let prod_odd = _mm512_mul_epi32(vr_shift, vq_shift);
-
-        acc_even = _mm512_add_epi64(acc_even, prod_even);
-        acc_odd = _mm512_add_epi64(acc_odd, prod_odd);
-    }
-
-    let acc = _mm512_add_epi64(acc_even, acc_odd);
-    let mut tmp = [0i64; 8];
-    _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, acc);
-
-    let mut sum = tmp.iter().sum::<i64>();
-
-    for i in (n16 * 16)..len {
-        sum += (r[i] as i64) * (q[i] as i64);
-    }
-
-    sum
-}
-
 #[inline]
 pub fn ani_from_intersection_and_cardinalities(
     inter_hat: f64,
