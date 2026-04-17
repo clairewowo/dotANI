@@ -13,6 +13,20 @@ use rayon::prelude::*;
 
 use std::time::Instant;
 
+#[cfg(not(feature = "cuda"))]
+pub fn dist_cuda(sketch_dist: &mut SketchDist) {
+    use log::error;
+
+    error!(
+        "Cuda is not supported. Please add `--features cuda` for installation to enable it."
+    );
+}
+
+#[cfg(feature = "cuda")]
+const CUDA_KERNEL_MY_STRUCT: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/cuda_dist.ptx"));
+
+
 #[cfg(all(target_arch = "x86_64", feature="cuda"))]
 //use std::arch::x86_64::*;
 //#[cfg(all(target_arch = "x86_64", feature = "cuda-sketch"))]

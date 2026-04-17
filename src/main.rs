@@ -324,7 +324,7 @@ fn main() {
     } else if let Some(dist_m) = matches.subcommand_matches(params::CMD_DIST) {
         let path_ref_sketch = dist_m.get_one::<PathBuf>("path_r").cloned().unwrap();
         let path_query_sketch = dist_m.get_one::<PathBuf>("path_q").cloned().unwrap();
-        let device = *dist_m.get_one::<String>("device").unwrap();
+        let device = dist_m.get_one::<String>("device").unwrap().clone();
 
         let cli_params = types::CliParams {
             mode: params::CMD_DIST.to_string(),
@@ -345,7 +345,7 @@ fn main() {
             ani_threshold: *dist_m.get_one::<f32>("ani_th").unwrap(),
             if_compressed: true,
             threads: *dist_m.get_one::<u8>("thread").unwrap(),
-            device: device.cloned(),
+            device: device,
 
             if_ull: true,
             ull_p: 0,
@@ -360,7 +360,7 @@ fn main() {
             .unwrap();
 
         let mut sketch_dist = types::SketchDist::new(&cli_params);
-        if device == "cpu" {
+        if cli_params.device == "cpu" {
             dist::dist(&mut sketch_dist);
         }
         else {
