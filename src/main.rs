@@ -324,6 +324,7 @@ fn main() {
     } else if let Some(dist_m) = matches.subcommand_matches(params::CMD_DIST) {
         let path_ref_sketch = dist_m.get_one::<PathBuf>("path_r").cloned().unwrap();
         let path_query_sketch = dist_m.get_one::<PathBuf>("path_q").cloned().unwrap();
+        let device = *dist_m.get_one::<String>("device").unwrap();
 
         let cli_params = types::CliParams {
             mode: params::CMD_DIST.to_string(),
@@ -344,7 +345,7 @@ fn main() {
             ani_threshold: *dist_m.get_one::<f32>("ani_th").unwrap(),
             if_compressed: true,
             threads: *dist_m.get_one::<u8>("thread").unwrap(),
-            device: *dist_m.get_one::<String>("device").unwrap(),
+            device: device.cloned(),
 
             if_ull: true,
             ull_p: 0,
@@ -363,7 +364,7 @@ fn main() {
             dist::dist(&mut sketch_dist);
         }
         else {
-            dist_cuda::dist(&mut sketch_dist);
+            dist_cuda::dist_cuda(&mut sketch_dist);
         }
     } else if let Some(search_m) = matches.subcommand_matches(params::CMD_SEARCH) {
         let path_ref_sketch = search_m
